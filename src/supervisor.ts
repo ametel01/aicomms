@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { isAbsolute, normalize } from "node:path";
+import { posix } from "node:path";
 import {
   type AppServerAdapter,
   HandlingStartError,
@@ -693,7 +693,11 @@ function validateNotificationInput(input: {
   if (typeof input.recipientAgentId !== "string" || input.recipientAgentId === "") {
     throw new Error("Notification recipient Agent ID is required.");
   }
-  if (typeof input.body !== "string" || Buffer.byteLength(input.body, "utf8") > 32 * 1024) {
+  if (
+    typeof input.body !== "string" ||
+    !isWellFormedUtf8(input.body) ||
+    Buffer.byteLength(input.body, "utf8") > 32 * 1024
+  ) {
     throw new Error("Notification body must be a UTF-8 string of at most 32 KiB.");
   }
   if (input.context === undefined) {
@@ -731,17 +735,23 @@ function validateNotificationInput(input: {
 }
 
 function normalizedRepositoryPath(reference: string): string {
-  const normalizedReference = normalize(reference);
+  const portableReference = reference.replaceAll("\\", "/");
+  const normalizedReference = posix.normalize(portableReference);
   if (
     reference === "" ||
-    isAbsolute(reference) ||
+    reference.includes("\0") ||
+    posix.isAbsolute(portableReference) ||
+    /^[A-Za-z]:\//.test(portableReference) ||
     normalizedReference === ".." ||
-    normalizedReference.startsWith("../") ||
-    normalizedReference.startsWith("..\\")
+    normalizedReference.startsWith("../")
   ) {
     throw new Error("Notification file references must stay within the Repository.");
   }
   return normalizedReference;
+}
+
+function isWellFormedUtf8(value: string): boolean {
+  return Buffer.from(value, "utf8").toString("utf8") === value;
 }
 
 function failureMessage(cause: unknown): string {
