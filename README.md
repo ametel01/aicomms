@@ -2,7 +2,7 @@
 
 `codex-meshd` is a proposed local Supervisor for autonomous communication between peer Codex Agents. It owns their Codex app-server threads, routes Messages without Agent polling, and keeps the Operator in control without making the Operator deliver each Message.
 
-> **Status:** implementation in progress. The Supervisor Interface validates startup and exercises
+> **Status:** v0 release gate implemented. The Supervisor Interface validates startup and exercises
 > atomic two-Agent lifecycle behavior with a scripted app-server Adapter and durable SQLite state.
 > Managed threads receive authenticated stdio MCP adapters for public discovery and FIFO
 > Notification delivery with durable outcomes. Questions now complete asynchronously through a
@@ -14,6 +14,8 @@
 > Unexpected app-server loss fails open work without replay, while the next startup terminalizes
 > stale Mesh evidence as `supervisor_lost` before creating fresh Agent and thread identities.
 > Startup validates and reports Codex CLI 0.147.0 before connecting to the real stdio app-server.
+> The automated acceptance tracer proves a Writer → Adviser → Writer exchange ending in one
+> verified, bounded Repository change without Agent polling, human delivery, or Adviser writes.
 
 ## Confirmed v0
 
@@ -26,7 +28,9 @@ The first prototype is deliberately narrow:
 - A Supervisor-owned SQLite Transcript and explicit loop, queue, deadline, and authority boundaries.
 - No remote peers, arbitrary-session attachment, multiple writers, or crash recovery.
 
-The target proof is a fully automatic Writer → Adviser → Writer exchange that produces and verifies a bounded Repository change without Agent polling, human message delivery, or Adviser writes.
+The release proof is a fully automatic Writer → Adviser → Writer exchange that produces and
+verifies a bounded Repository change without Agent polling, human message delivery, or Adviser
+writes.
 
 ## Operator controls
 
@@ -62,6 +66,8 @@ codex app-server generate-json-schema --experimental --out protocol/codex-0.147.
 `bun test test/codex-compatibility.test.ts` runs the narrow real smoke test: initialization plus two
 ephemeral managed threads with distinct per-thread MCP identities. The deterministic behavioral
 suite continues to use the scripted Adapter and does not invoke a model.
+`bun test test/autonomous-collaboration.test.ts` runs the release-gating tracer bullet and verifies
+the complete correlated Transcript and bounded Repository diff.
 
 ## Documentation
 

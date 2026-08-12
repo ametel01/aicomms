@@ -34,10 +34,19 @@ export class TestRepository {
   }
 
   git(cwd: string, ...args: string[]): void {
+    this.#runGit(cwd, args);
+  }
+
+  gitOutput(cwd: string, ...args: string[]): string {
+    return this.#runGit(cwd, args).stdout.toString().trim();
+  }
+
+  #runGit(cwd: string, args: string[]) {
     const result = Bun.spawnSync(["git", ...args], { cwd, stderr: "pipe", stdout: "pipe" });
     if (result.exitCode !== 0) {
       throw new Error(result.stderr.toString());
     }
+    return result;
   }
 
   track(directory: string): void {

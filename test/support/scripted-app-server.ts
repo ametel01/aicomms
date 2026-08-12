@@ -53,6 +53,10 @@ export class ScriptedAppServer implements AppServerAdapter {
   #nextOperatorResponseFailure: string | undefined;
   #handlingStartGate: ReturnType<typeof Promise.withResolvers<void>> | undefined;
   #nextThreadStartExit: string | undefined;
+  #handlingScript:
+    | ((request: StartHandlingRequest) => HandlingCompletion | Promise<HandlingCompletion>)
+    | undefined;
+  #scriptedHandlingCount = 0;
 
   constructor(private readonly failure?: ScriptedFailure) {}
 
@@ -109,6 +113,12 @@ export class ScriptedAppServer implements AppServerAdapter {
 
   completeHandling(finalOutput?: string): void {
     this.#handlingCompletion?.resolve(finalOutput === undefined ? {} : { finalOutput });
+  }
+
+  scriptHandlings(
+    handler: (request: StartHandlingRequest) => HandlingCompletion | Promise<HandlingCompletion>,
+  ): void {
+    this.#handlingScript = handler;
   }
 
   failNextHandling(failure: "handling-rejected" | "handling-start" | "handling-completion"): void {
@@ -177,6 +187,13 @@ export class ScriptedAppServer implements AppServerAdapter {
     }
     if (failure === "handling-timeout") {
       throw new HandlingStartError("scripted timeout", "uncertain");
+    }
+    if (this.#handlingScript) {
+      this.#scriptedHandlingCount += 1;
+      return {
+        turnId: `turn-handling-${this.#scriptedHandlingCount}`,
+        completed: Promise.resolve().then(() => this.#handlingScript?.(request) ?? {}),
+      };
     }
     return {
       turnId: "turn-handling-1",
