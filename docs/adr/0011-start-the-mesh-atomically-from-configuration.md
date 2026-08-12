@@ -1,0 +1,3 @@
+# Start the Mesh atomically from configuration
+
+The Operator will define exactly one Writer and one Adviser in a checked-in Mesh Configuration, including unique Agent Names, fixed Objectives, model options, and trusted instructions; runtime Agent IDs remain generated and ephemeral. Before autonomous work begins, the Supervisor must validate the Repository identity, configuration and limits, store permissions and migrations, Codex compatibility and initialization, both threads and MCP connections, and the role-specific sandboxes. It then starts only the Writer's initial Objective turn and keeps the Adviser idle until a Message arrives, so a partially initialized Mesh never begins work and the advisory path remains deterministically available.

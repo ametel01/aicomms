@@ -1,0 +1,3 @@
+# Bind Agent identity to its MCP connection
+
+Each managed Codex thread will receive its own stdio MCP adapter process, with a Supervisor-issued Agent ID and Agent Credential supplied through that process's environment. The adapter authenticates to the Supervisor over a private, owner-only Unix socket and never accesses the Transcript store directly. The Supervisor derives the caller of every `agents.*` operation from that connection and will not accept a sender identity in tool arguments; this avoids spoofable identity claims while staying on the stable MCP integration path instead of depending on experimental app-server dynamic tools.

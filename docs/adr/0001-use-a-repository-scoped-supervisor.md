@@ -1,0 +1,3 @@
+# Use a repository-scoped supervisor
+
+The first prototype will use one local Supervisor for one Repository, and the Supervisor will own one Codex app-server process and every participating thread. Repository identity is derived by canonicalizing and hashing Git's absolute common-directory path, and startup outside a Git repository is rejected. An Agent is exactly one Supervisor-managed thread; replacing the thread creates a new Agent identity. This deliberately excludes arbitrary existing sessions, cross-repository routing, remote peers, and durable identity so the prototype can test autonomous peer coordination without first solving attachment and recovery.

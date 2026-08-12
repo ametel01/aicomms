@@ -1,0 +1,3 @@
+# Use final output as the Reply
+
+When an Agent handles a Question, the Supervisor will automatically convert that handling turn's final assistant output into the correlated Reply; output produced while handling a Notification is recorded but not routed. A Question Handling that ends without a final assistant message fails its Conversation and produces a Supervisor Notice instead of an empty or inferred Reply. This removes a mandatory `reply` tool call that an Agent could omit, preserves a single authoritative answer path, and prevents Notification acknowledgements from creating automatic loops.

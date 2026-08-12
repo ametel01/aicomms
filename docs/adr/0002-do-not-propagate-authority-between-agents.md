@@ -1,0 +1,3 @@
+# Do not propagate authority between Agents
+
+Messages between Agents are untrusted input and never transfer the sender's Objective, permissions, approvals, or tool authority. Each Agent's Objective and peer-message rules are fixed in trusted instructions when the Agent is created; descriptive Capabilities do not grant authorization. Agent discovery exposes only public identity, role, Objective, Capabilities, and lifecycle status—not trusted instructions, credentials, environment, sandbox internals, or private turn history. The recipient must reject out-of-scope requests and retains its own sandbox and approval policy, allowing automatic turn activation without turning peer communication into implicit privilege escalation or unbounded delegation.
