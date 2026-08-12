@@ -1,6 +1,6 @@
 # Documentation
 
-This documentation describes the confirmed design for `codex-meshd`. The project has no implementation or end-user product yet, so the current material is for developers and maintainers.
+This documentation describes the confirmed design for `codex-meshd`. Implementation is in progress, and the current CLI only validates startup inputs, so the material remains focused on developers and maintainers.
 
 ## Developer documentation
 

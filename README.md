@@ -2,7 +2,7 @@
 
 `codex-meshd` is a proposed local Supervisor for autonomous communication between peer Codex Agents. It owns their Codex app-server threads, routes Messages without Agent polling, and keeps the Operator in control without making the Operator deliver each Message.
 
-> **Status:** design complete; implementation has not started. This repository does not yet provide an executable daemon or CLI.
+> **Status:** implementation in progress. The current CLI validates Repository identity and Mesh Configuration; it does not yet start Agent threads or route Messages.
 
 ## Confirmed v0
 
