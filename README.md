@@ -5,8 +5,9 @@
 > **Status:** implementation in progress. The Supervisor Interface validates startup and exercises
 > atomic two-Agent lifecycle behavior with a scripted app-server Adapter and durable SQLite state.
 > Managed threads receive authenticated stdio MCP adapters for public discovery and FIFO
-> Notification delivery with durable outcomes. The Operator CLI does not yet connect to a real
-> Codex app-server.
+> Notification delivery with durable outcomes. Questions now complete asynchronously through a
+> correlated Reply turn, with deferred failures delivered as Supervisor Notices. The Operator CLI
+> does not yet connect to a real Codex app-server.
 
 ## Confirmed v0
 

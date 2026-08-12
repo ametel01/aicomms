@@ -24,13 +24,15 @@ export interface SendNotificationInput {
 
 export interface DiscoveryOperations {
   sendNotification(callerAgentId: string, input: SendNotificationInput): Promise<string>;
+  askQuestion(callerAgentId: string, input: SendNotificationInput): Promise<string>;
 }
 
 type DiscoveryRequest =
   | { id: number; operation: "authenticate"; agentId: string; credential: string }
   | { id: number; operation: "list" }
   | { id: number; operation: "inspect"; agentId: string }
-  | { id: number; operation: "send"; input: SendNotificationInput };
+  | { id: number; operation: "send"; input: SendNotificationInput }
+  | { id: number; operation: "ask"; input: SendNotificationInput };
 
 interface DiscoveryResponse {
   id: number;
@@ -162,9 +164,11 @@ export class DiscoveryServer {
     if (request.operation === "list") {
       return { id: request.id, ok: true, result: this.agents.map(publicRegistration) };
     }
-    if (request.operation === "send") {
+    if (request.operation === "send" || request.operation === "ask") {
       try {
-        const messageId = await this.operations.sendNotification(callerAgentId, request.input);
+        const messageId = await (request.operation === "send"
+          ? this.operations.sendNotification(callerAgentId, request.input)
+          : this.operations.askQuestion(callerAgentId, request.input));
         return { id: request.id, ok: true, result: { message_id: messageId } };
       } catch (cause) {
         return {

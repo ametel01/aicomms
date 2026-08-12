@@ -3,6 +3,7 @@ import type {
   HandlingCompletion,
   HandlingHandle,
   StartHandlingRequest,
+  StartNoticeRequest,
   StartObjectiveRequest,
   StartThreadRequest,
   ThreadHandle,
@@ -31,12 +32,14 @@ export class ScriptedAppServer implements AppServerAdapter {
     | { operation: "start-thread"; request: StartThreadRequest }
     | { operation: "start-objective"; request: StartObjectiveRequest }
     | { operation: "start-handling"; request: StartHandlingRequest }
+    | { operation: "start-notice"; request: StartNoticeRequest }
     | { operation: "resume-thread"; threadId: string }
     | { operation: "close" }
   > = [];
   statusSubscriptionCount = 0;
   readonly #statusListeners = new Set<ThreadStatusListener>();
   #handlingCompletion: ReturnType<typeof Promise.withResolvers<HandlingCompletion>> | undefined;
+  #nextHandlingFailure: ScriptedFailure | undefined;
 
   constructor(private readonly failure?: ScriptedFailure) {}
 
@@ -58,10 +61,18 @@ export class ScriptedAppServer implements AppServerAdapter {
     this.#handlingCompletion?.resolve(finalOutput === undefined ? {} : { finalOutput });
   }
 
+  failNextHandling(failure: "handling-rejected" | "handling-start" | "handling-completion"): void {
+    this.#nextHandlingFailure = failure;
+  }
+
   handlingRequests(): StartHandlingRequest[] {
     return this.calls.flatMap((call) =>
       call.operation === "start-handling" ? [call.request] : [],
     );
+  }
+
+  noticeRequests(): StartNoticeRequest[] {
+    return this.calls.flatMap((call) => (call.operation === "start-notice" ? [call.request] : []));
   }
 
   async initialize(): Promise<void> {
@@ -92,25 +103,32 @@ export class ScriptedAppServer implements AppServerAdapter {
 
   async startHandling(request: StartHandlingRequest): Promise<HandlingHandle> {
     this.calls.push({ operation: "start-handling", request });
-    if (this.failure === "handling-start") {
+    const failure = this.#nextHandlingFailure ?? this.failure;
+    this.#nextHandlingFailure = undefined;
+    if (failure === "handling-start") {
       throw new HandlingStartError("scripted ambiguous acceptance", "uncertain");
     }
-    if (this.failure === "handling-rejected") {
+    if (failure === "handling-rejected") {
       throw new HandlingStartError("scripted definite rejection", "rejected");
     }
-    if (this.failure === "handling-disconnect") {
+    if (failure === "handling-disconnect") {
       throw new HandlingStartError("scripted disconnect", "uncertain");
     }
-    if (this.failure === "handling-timeout") {
+    if (failure === "handling-timeout") {
       throw new HandlingStartError("scripted timeout", "uncertain");
     }
     return {
       turnId: "turn-handling-1",
       completed:
-        this.failure === "handling-completion"
+        failure === "handling-completion"
           ? Promise.reject(new Error("scripted Handling completion failure"))
           : (this.#handlingCompletion?.promise ?? Promise.resolve({ finalOutput: "Handled." })),
     };
+  }
+
+  async startNotice(request: StartNoticeRequest): Promise<HandlingHandle> {
+    this.calls.push({ operation: "start-notice", request });
+    return { turnId: "turn-notice-1", completed: Promise.resolve({}) };
   }
 
   async resumeThread(threadId: string): Promise<void> {

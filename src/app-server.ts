@@ -1,5 +1,5 @@
 import type { AgentConfiguration, AgentRole, PublicAgent } from "./startup-validation.ts";
-import type { Message } from "./transcript-store.ts";
+import type { Message, SupervisorNotice } from "./transcript-store.ts";
 
 export type AgentSandbox = "workspace-write" | "read-only";
 
@@ -33,6 +33,11 @@ export interface StartHandlingRequest {
   message: Message;
 }
 
+export interface StartNoticeRequest {
+  threadId: string;
+  notice: SupervisorNotice;
+}
+
 export interface HandlingCompletion {
   finalOutput?: string;
 }
@@ -57,6 +62,7 @@ export interface AppServerAdapter {
   startThread(request: StartThreadRequest): Promise<ThreadHandle>;
   startObjective(request: StartObjectiveRequest): Promise<{ turnId: string }>;
   startHandling(request: StartHandlingRequest): Promise<HandlingHandle>;
+  startNotice(request: StartNoticeRequest): Promise<HandlingHandle>;
   resumeThread(threadId: string): Promise<void>;
   onThreadStatusChanged(listener: ThreadStatusListener): () => void;
   close(): Promise<void>;
@@ -77,6 +83,9 @@ export function unavailableAppServerAdapter(): AppServerAdapter {
       throw new Error("The real Codex app-server Adapter is not available yet.");
     },
     async startHandling(): Promise<HandlingHandle> {
+      throw new Error("The real Codex app-server Adapter is not available yet.");
+    },
+    async startNotice(): Promise<HandlingHandle> {
       throw new Error("The real Codex app-server Adapter is not available yet.");
     },
     async resumeThread(): Promise<void> {

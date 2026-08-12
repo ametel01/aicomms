@@ -53,7 +53,7 @@ class SupervisorSocketClient {
   }
 
   async call(
-    operation: "list" | "inspect" | "send",
+    operation: "list" | "inspect" | "send" | "ask",
     arguments_?: Record<string, unknown>,
   ): Promise<SocketResponse>;
   async call(
@@ -160,8 +160,11 @@ async function handleJsonRpc(
     typeof params.arguments.agent_id === "string"
   ) {
     response = await supervisor.call("inspect", { agentId: params.arguments.agent_id });
-  } else if (params.name === "agents.send" && validSendArguments(params.arguments)) {
-    response = await supervisor.call("send", {
+  } else if (
+    (params.name === "agents.send" || params.name === "agents.ask") &&
+    validSendArguments(params.arguments)
+  ) {
+    response = await supervisor.call(params.name === "agents.send" ? "send" : "ask", {
       input: {
         recipientAgentId: params.arguments.agent_id,
         body: params.arguments.body,
@@ -204,27 +207,36 @@ function toolDefinitions(): unknown[] {
     {
       name: "agents.send",
       description: "Send a Notification to another Agent without waiting for Handling.",
-      inputSchema: {
+      inputSchema: messageInputSchema(),
+    },
+    {
+      name: "agents.ask",
+      description: "Ask another Agent a Question without waiting for its Reply.",
+      inputSchema: messageInputSchema(),
+    },
+  ];
+}
+
+function messageInputSchema(): unknown {
+  return {
+    type: "object",
+    properties: {
+      agent_id: { type: "string" },
+      body: { type: "string" },
+      context: {
         type: "object",
         properties: {
-          agent_id: { type: "string" },
-          body: { type: "string" },
-          context: {
-            type: "object",
-            properties: {
-              subject: { type: "string" },
-              file_references: { type: "array", items: { type: "string" } },
-              git_commit_id: { type: "string" },
-              worktree_fingerprint: { type: "string" },
-            },
-            additionalProperties: false,
-          },
+          subject: { type: "string" },
+          file_references: { type: "array", items: { type: "string" } },
+          git_commit_id: { type: "string" },
+          worktree_fingerprint: { type: "string" },
         },
-        required: ["agent_id", "body"],
         additionalProperties: false,
       },
     },
-  ];
+    required: ["agent_id", "body"],
+    additionalProperties: false,
+  };
 }
 
 function respond(id: number | string, result: unknown): void {

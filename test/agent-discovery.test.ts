@@ -55,6 +55,7 @@ describe("authenticated Agent discovery", () => {
         expect.objectContaining({ name: "agents.list" }),
         expect.objectContaining({ name: "agents.inspect" }),
         expect.objectContaining({ name: "agents.send" }),
+        expect.objectContaining({ name: "agents.ask" }),
       ],
     });
     const list = await writer.request("tools/call", {

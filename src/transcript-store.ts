@@ -22,12 +22,13 @@ export interface NotificationContext {
 
 export interface Message extends NotificationContext {
   id: string;
-  kind: "notification";
+  kind: "notification" | "question" | "reply";
   senderAgentId: string;
   recipientAgentId: string;
   conversationId: string;
   createdAt: string;
   body: string;
+  inReplyTo?: string;
 }
 
 export interface Delivery {
@@ -66,6 +67,7 @@ export interface TranscriptEvent {
     | "conversation.completed"
     | "conversation.failed"
     | "delivery.rejected"
+    | "delivery.cancelled"
     | "delivery.ambiguous";
   createdAt: string;
 }
@@ -76,7 +78,19 @@ export interface ConversationSnapshot {
   message: Message;
   delivery: Delivery;
   handling?: Handling;
+  messages: Message[];
+  deliveries: Delivery[];
+  handlings: Handling[];
+  notices: SupervisorNotice[];
   events: TranscriptEvent[];
+}
+
+export interface SupervisorNotice {
+  id: number;
+  recipientAgentId: string;
+  conversationId: string;
+  reason: string;
+  createdAt: string;
 }
 
 interface MeshRunRow {
@@ -98,7 +112,7 @@ interface AgentRow {
 
 interface MessageRow {
   id: string;
-  kind: "notification";
+  kind: Message["kind"];
   sender_agent_id: string;
   recipient_agent_id: string;
   conversation_id: string;
@@ -108,6 +122,22 @@ interface MessageRow {
   file_references: string | null;
   git_commit_id: string | null;
   worktree_fingerprint: string | null;
+  in_reply_to: string | null;
+}
+
+interface HandlingRow {
+  status: Handling["status"];
+  codex_turn_id: string;
+  final_output: string | null;
+  failure_message: string | null;
+}
+
+interface NoticeRow {
+  id: number;
+  recipient_agent_id: string;
+  conversation_id: string;
+  reason: string;
+  created_at: string;
 }
 
 export class TranscriptStore {
@@ -157,7 +187,8 @@ export class TranscriptStore {
         subject TEXT,
         file_references TEXT,
         git_commit_id TEXT,
-        worktree_fingerprint TEXT
+        worktree_fingerprint TEXT,
+        in_reply_to TEXT
       );
       CREATE TRIGGER IF NOT EXISTS messages_are_immutable
       BEFORE UPDATE ON messages
@@ -183,9 +214,17 @@ export class TranscriptStore {
         type TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS supervisor_notices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recipient_agent_id TEXT NOT NULL REFERENCES agents(id),
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
     ensureColumn(database, "deliveries", "failure_message", "TEXT");
     ensureColumn(database, "handlings", "failure_message", "TEXT");
+    ensureMessageColumn(database);
     return new TranscriptStore(database);
   }
 
@@ -262,45 +301,84 @@ export class TranscriptStore {
     const record = this.database.transaction(() => {
       this.database
         .query(
-          "INSERT INTO conversations (id, mesh_run_id, status, created_at) VALUES (?, ?, 'open', ?)",
+          `INSERT INTO conversations (id, mesh_run_id, status, created_at)
+           VALUES (?, ?, 'open', ?) ON CONFLICT(id) DO NOTHING`,
         )
         .run(message.conversationId, meshRunId, message.createdAt);
-      this.database
-        .query(
-          `INSERT INTO messages
-            (id, conversation_id, kind, sender_agent_id, recipient_agent_id, created_at, body,
-             subject, file_references, git_commit_id, worktree_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          message.id,
-          message.conversationId,
-          message.kind,
-          message.senderAgentId,
-          message.recipientAgentId,
-          message.createdAt,
-          message.body,
-          message.subject ?? null,
-          message.fileReferences ? JSON.stringify(message.fileReferences) : null,
-          message.gitCommitId ?? null,
-          message.worktreeFingerprint ?? null,
-        );
-      this.database
-        .query("INSERT INTO deliveries (message_id, status) VALUES (?, 'accepted')")
-        .run(message.id);
+      this.insertMessage(message);
       this.recordEvent(message.conversationId, "message.accepted");
     });
     record();
   }
 
-  markDeliveryInjecting(message: Message): void {
-    const update = this.database.transaction(() => {
+  completeQuestionWithReply(
+    message: Message,
+    turnId: string,
+    finalOutput: string,
+    reply: Message,
+  ): void {
+    const complete = this.database.transaction(() => {
       this.database
-        .query("UPDATE deliveries SET status = 'injecting' WHERE message_id = ?")
+        .query(
+          "UPDATE handlings SET status = 'completed', final_output = ? WHERE message_id = ? AND codex_turn_id = ?",
+        )
+        .run(finalOutput, message.id, turnId);
+      this.recordEvent(message.conversationId, "handling.completed");
+      this.insertMessage(reply);
+      this.recordEvent(reply.conversationId, "message.accepted");
+    });
+    complete();
+  }
+
+  failQuestionWithoutReply(message: Message, turnId: string): SupervisorNotice {
+    this.failHandling(message, turnId, "Question Handling produced no final assistant output.");
+    return this.recordSupervisorNotice(message, "Question Handling produced no Reply.");
+  }
+
+  recordSupervisorNotice(
+    message: Message,
+    reason: string,
+    recipientAgentId = message.senderAgentId,
+  ): SupervisorNotice {
+    const createdAt = new Date().toISOString();
+    const result = this.database
+      .query(
+        `INSERT INTO supervisor_notices
+          (recipient_agent_id, conversation_id, reason, created_at) VALUES (?, ?, ?, ?)`,
+      )
+      .run(recipientAgentId, message.conversationId, reason, createdAt);
+    return {
+      id: Number(result.lastInsertRowid),
+      recipientAgentId,
+      conversationId: message.conversationId,
+      reason,
+      createdAt,
+    };
+  }
+
+  markDeliveryInjecting(message: Message): boolean {
+    let claimed = false;
+    const update = this.database.transaction(() => {
+      const result = this.database
+        .query(
+          `UPDATE deliveries SET status = 'injecting'
+           WHERE message_id = ? AND status IN ('accepted', 'queued')
+             AND EXISTS (
+               SELECT 1
+               FROM messages
+               JOIN conversations ON conversations.id = messages.conversation_id
+               WHERE messages.id = deliveries.message_id AND conversations.status = 'open'
+             )`,
+        )
         .run(message.id);
+      if (result.changes !== 1) {
+        return;
+      }
+      claimed = true;
       this.recordEvent(message.conversationId, "delivery.injecting");
     });
     update();
+    return claimed;
   }
 
   markDeliveryQueued(message: Message): void {
@@ -313,6 +391,28 @@ export class TranscriptStore {
     update();
   }
 
+  isConversationOpen(conversationId: string): boolean {
+    const row = this.database
+      .query("SELECT status FROM conversations WHERE id = ?")
+      .get(conversationId) as { status: ConversationSnapshot["status"] } | null;
+    return row?.status === "open";
+  }
+
+  cancelDelivery(message: Message, failureMessage: string): void {
+    const cancel = this.database.transaction(() => {
+      const result = this.database
+        .query(
+          `UPDATE deliveries SET status = 'cancelled', failure_message = ?
+           WHERE message_id = ? AND status IN ('accepted', 'queued')`,
+        )
+        .run(failureMessage, message.id);
+      if (result.changes === 1) {
+        this.recordEvent(message.conversationId, "delivery.cancelled");
+      }
+    });
+    cancel();
+  }
+
   completeNotificationHandling(message: Message, turnId: string, finalOutput?: string): void {
     const complete = this.database.transaction(() => {
       this.database
@@ -321,10 +421,7 @@ export class TranscriptStore {
         )
         .run(finalOutput ?? null, message.id, turnId);
       this.recordEvent(message.conversationId, "handling.completed");
-      this.database
-        .query("UPDATE conversations SET status = 'completed' WHERE id = ?")
-        .run(message.conversationId);
-      this.recordEvent(message.conversationId, "conversation.completed");
+      this.completeConversationIfReady(message.conversationId);
     });
     complete();
   }
@@ -398,27 +495,33 @@ export class TranscriptStore {
     if (!conversation) {
       return undefined;
     }
-    const row = this.database
-      .query("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at LIMIT 1")
-      .get(conversationId) as MessageRow;
-    const message = messageFromRow(row);
-    const deliveryRow = this.database
-      .query("SELECT status, codex_turn_id, failure_message FROM deliveries WHERE message_id = ?")
-      .get(message.id) as {
-      status: Delivery["status"];
-      codex_turn_id: string | null;
-      failure_message: string | null;
-    };
-    const handlingRow = this.database
-      .query(
-        "SELECT status, codex_turn_id, final_output, failure_message FROM handlings WHERE message_id = ?",
-      )
-      .get(message.id) as {
-      status: Handling["status"];
-      codex_turn_id: string;
-      final_output: string | null;
-      failure_message: string | null;
-    } | null;
+    const messages = (
+      this.database
+        .query("SELECT * FROM messages WHERE conversation_id = ? ORDER BY rowid")
+        .all(conversationId) as MessageRow[]
+    ).map(messageFromRow);
+    const message = messages[0];
+    if (!message) {
+      return undefined;
+    }
+    const deliveries = messages.map((candidate) => {
+      const row = this.database
+        .query("SELECT status, codex_turn_id, failure_message FROM deliveries WHERE message_id = ?")
+        .get(candidate.id) as {
+        status: Delivery["status"];
+        codex_turn_id: string | null;
+        failure_message: string | null;
+      };
+      return deliveryFromRow(candidate.id, row);
+    });
+    const handlings = messages.flatMap((candidate) => {
+      const row = this.database
+        .query(
+          "SELECT status, codex_turn_id, final_output, failure_message FROM handlings WHERE message_id = ?",
+        )
+        .get(candidate.id) as HandlingRow | null;
+      return row ? [handlingFromRow(candidate.id, row)] : [];
+    });
     const eventRows = this.database
       .query(
         "SELECT sequence, type, created_at FROM transcript_events WHERE conversation_id = ? ORDER BY sequence",
@@ -432,25 +535,17 @@ export class TranscriptStore {
       id: conversation.id,
       status: conversation.status,
       message,
-      delivery: {
-        messageId: message.id,
-        status: deliveryRow.status,
-        ...(deliveryRow.codex_turn_id ? { codexTurnId: deliveryRow.codex_turn_id } : {}),
-        ...(deliveryRow.failure_message ? { failureMessage: deliveryRow.failure_message } : {}),
-      },
-      ...(handlingRow
-        ? {
-            handling: {
-              messageId: message.id,
-              status: handlingRow.status,
-              codexTurnId: handlingRow.codex_turn_id,
-              ...(handlingRow.final_output ? { finalOutput: handlingRow.final_output } : {}),
-              ...(handlingRow.failure_message
-                ? { failureMessage: handlingRow.failure_message }
-                : {}),
-            },
-          }
-        : {}),
+      delivery: deliveries[0] as Delivery,
+      ...(handlings[0] ? { handling: handlings[0] } : {}),
+      messages,
+      deliveries,
+      handlings,
+      notices: this.database
+        .query(
+          "SELECT id, recipient_agent_id, conversation_id, reason, created_at FROM supervisor_notices WHERE conversation_id = ? ORDER BY id",
+        )
+        .all(conversationId)
+        .map((row) => noticeFromRow(row as NoticeRow)),
       events: eventRows.map((event) => ({
         sequence: event.sequence,
         type: event.type,
@@ -498,6 +593,66 @@ export class TranscriptStore {
       .query("INSERT INTO transcript_events (conversation_id, type, created_at) VALUES (?, ?, ?)")
       .run(conversationId, type, new Date().toISOString());
   }
+
+  private completeConversationIfReady(conversationId: string): void {
+    const incomplete = this.database
+      .query(
+        `SELECT 1
+         FROM messages AS message
+         LEFT JOIN deliveries AS delivery ON delivery.message_id = message.id
+         LEFT JOIN handlings AS handling ON handling.message_id = message.id
+         WHERE message.conversation_id = ?
+           AND (
+             delivery.status != 'injected'
+             OR handling.status != 'completed'
+             OR (
+               message.kind = 'question'
+               AND NOT EXISTS (
+                 SELECT 1 FROM messages AS reply
+                 WHERE reply.kind = 'reply' AND reply.in_reply_to = message.id
+               )
+             )
+           )
+         LIMIT 1`,
+      )
+      .get(conversationId);
+    if (incomplete) {
+      return;
+    }
+    const result = this.database
+      .query("UPDATE conversations SET status = 'completed' WHERE id = ? AND status = 'open'")
+      .run(conversationId);
+    if (result.changes === 1) {
+      this.recordEvent(conversationId, "conversation.completed");
+    }
+  }
+
+  private insertMessage(message: Message): void {
+    this.database
+      .query(
+        `INSERT INTO messages
+          (id, conversation_id, kind, sender_agent_id, recipient_agent_id, created_at, body,
+           subject, file_references, git_commit_id, worktree_fingerprint, in_reply_to)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        message.id,
+        message.conversationId,
+        message.kind,
+        message.senderAgentId,
+        message.recipientAgentId,
+        message.createdAt,
+        message.body,
+        message.subject ?? null,
+        message.fileReferences ? JSON.stringify(message.fileReferences) : null,
+        message.gitCommitId ?? null,
+        message.worktreeFingerprint ?? null,
+        message.inReplyTo ?? null,
+      );
+    this.database
+      .query("INSERT INTO deliveries (message_id, status) VALUES (?, 'accepted')")
+      .run(message.id);
+  }
 }
 
 function messageFromRow(row: MessageRow): Message {
@@ -513,6 +668,39 @@ function messageFromRow(row: MessageRow): Message {
     ...(row.file_references ? { fileReferences: JSON.parse(row.file_references) as string[] } : {}),
     ...(row.git_commit_id ? { gitCommitId: row.git_commit_id } : {}),
     ...(row.worktree_fingerprint ? { worktreeFingerprint: row.worktree_fingerprint } : {}),
+    ...(row.in_reply_to ? { inReplyTo: row.in_reply_to } : {}),
+  };
+}
+
+function deliveryFromRow(
+  messageId: string,
+  row: { status: Delivery["status"]; codex_turn_id: string | null; failure_message: string | null },
+): Delivery {
+  return {
+    messageId,
+    status: row.status,
+    ...(row.codex_turn_id ? { codexTurnId: row.codex_turn_id } : {}),
+    ...(row.failure_message ? { failureMessage: row.failure_message } : {}),
+  };
+}
+
+function handlingFromRow(messageId: string, row: HandlingRow): Handling {
+  return {
+    messageId,
+    status: row.status,
+    codexTurnId: row.codex_turn_id,
+    ...(row.final_output ? { finalOutput: row.final_output } : {}),
+    ...(row.failure_message ? { failureMessage: row.failure_message } : {}),
+  };
+}
+
+function noticeFromRow(row: NoticeRow): SupervisorNotice {
+  return {
+    id: row.id,
+    recipientAgentId: row.recipient_agent_id,
+    conversationId: row.conversation_id,
+    reason: row.reason,
+    createdAt: row.created_at,
   };
 }
 
@@ -525,5 +713,12 @@ function ensureColumn(
   const columns = database.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   if (!columns.some((candidate) => candidate.name === column)) {
     database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+function ensureMessageColumn(database: Database): void {
+  const columns = database.query("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+  if (!columns.some((candidate) => candidate.name === "in_reply_to")) {
+    database.exec("ALTER TABLE messages ADD COLUMN in_reply_to TEXT");
   }
 }

@@ -6,7 +6,7 @@ import {
   sandboxForRole,
   unavailableAppServerAdapter,
 } from "./app-server.ts";
-import { DiscoveryServer } from "./discovery-server.ts";
+import { DiscoveryServer, type SendNotificationInput } from "./discovery-server.ts";
 import {
   type AgentConfiguration,
   type AgentLifecycleStatus,
@@ -25,6 +25,7 @@ import {
   type MeshRun,
   type Message,
   type NotificationContext,
+  type SupervisorNotice,
   TranscriptStore,
 } from "./transcript-store.ts";
 
@@ -116,6 +117,11 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         queues: new Map(),
         delivering: new Set(),
         queuedMessageIds: new Set(),
+        generateOpaqueValue,
+        agents: [],
+        noticeQueues: new Map(),
+        meshRunId,
+        handlingConversations: new Map(),
       };
 
       try {
@@ -128,34 +134,44 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         });
         meshRunRecorded = true;
         const agents = agentRuntime.map(({ agent }) => agent);
+        scheduler.agents = agents;
+        const acceptPeerMessage = async (
+          kind: "notification" | "question",
+          callerAgentId: string,
+          input: SendNotificationInput,
+        ): Promise<string> => {
+          if (!store) {
+            throw new Error("Transcript is unavailable.");
+          }
+          const transcript = store;
+          const validatedInput = validateNotificationInput(input);
+          const recipient = agents.find((agent) => agent.id === input.recipientAgentId);
+          if (!recipient?.threadId) {
+            throw new Error("Recipient Agent is unavailable.");
+          }
+          enforceQueueCapacity(scheduler, recipient);
+          const message = peerMessage(
+            kind,
+            generateOpaqueValue(),
+            scheduler.handlingConversations.get(callerAgentId) ?? generateOpaqueValue(),
+            callerAgentId,
+            validatedInput.recipientAgentId,
+            validatedInput.body,
+            validatedInput.context,
+          );
+          transcript.recordNotification(meshRunId, message);
+          enqueueNotification(scheduler, appServer, transcript, meshRunId, recipient, message);
+          return message.id;
+        };
         discoveryServer = await DiscoveryServer.start(
           validation.repository.rootDirectory,
           agentRuntime.map(({ agent, credential }) => ({ agentId: agent.id, credential })),
           agents,
           {
-            sendNotification: async (callerAgentId, input) => {
-              if (!store) {
-                throw new Error("Transcript is unavailable.");
-              }
-              const transcript = store;
-              const validatedInput = validateNotificationInput(input);
-              const recipient = agents.find((agent) => agent.id === input.recipientAgentId);
-              if (!recipient?.threadId) {
-                throw new Error("Recipient Agent is unavailable.");
-              }
-              enforceQueueCapacity(scheduler, recipient);
-              const message = notification(
-                generateOpaqueValue(),
-                generateOpaqueValue(),
-                callerAgentId,
-                validatedInput.recipientAgentId,
-                validatedInput.body,
-                validatedInput.context,
-              );
-              transcript.recordNotification(meshRunId, message);
-              enqueueNotification(scheduler, appServer, transcript, meshRunId, recipient, message);
-              return message.id;
-            },
+            sendNotification: (callerAgentId, input) =>
+              acceptPeerMessage("notification", callerAgentId, input),
+            askQuestion: (callerAgentId, input) =>
+              acceptPeerMessage("question", callerAgentId, input),
           },
         );
         await appServer.initialize();
@@ -166,7 +182,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           }
           agent.status = lifecycleStatus(status);
           store?.updateAgentStatus(meshRunId, agent);
-          if (agent.status === "idle" && store) {
+          if ((agent.status === "idle" || agent.status === "unloaded") && store) {
             scheduleDelivery(scheduler, appServer, store, meshRunId, agent);
           }
         });
@@ -353,6 +369,11 @@ interface DeliveryScheduler {
   queues: Map<string, Message[]>;
   delivering: Set<string>;
   queuedMessageIds: Set<string>;
+  generateOpaqueValue: () => string;
+  agents: PublicAgent[];
+  noticeQueues: Map<string, SupervisorNotice[]>;
+  meshRunId: string;
+  handlingConversations: Map<string, string>;
 }
 
 const MAX_QUEUED_MESSAGES_PER_AGENT = 32;
@@ -424,6 +445,16 @@ async function drainRecipientQueue(
   try {
     const queue = scheduler.queues.get(recipient.id);
     while (queue && queue.length > 0) {
+      const nextMessage = queue[0];
+      if (nextMessage && !store.isConversationOpen(nextMessage.conversationId)) {
+        queue.shift();
+        scheduler.queuedMessageIds.delete(nextMessage.id);
+        store.cancelDelivery(
+          nextMessage,
+          "Delivery cancelled because its Conversation is already terminal.",
+        );
+        continue;
+      }
       if (recipient.status === "unloaded") {
         if (!recipient.threadId) {
           return;
@@ -435,6 +466,9 @@ async function drainRecipientQueue(
           for (const failedMessage of queue.splice(0)) {
             scheduler.queuedMessageIds.delete(failedMessage.id);
             store.failDelivery(failedMessage, message);
+            if (failedMessage.kind === "question" || failedMessage.kind === "reply") {
+              queueSupervisorNotice(scheduler, appServer, store, failedMessage, message);
+            }
           }
           return;
         }
@@ -447,10 +481,50 @@ async function drainRecipientQueue(
       const message = queue.shift();
       if (message) {
         scheduler.queuedMessageIds.delete(message.id);
-        const outcome = await deliverNotification(appServer, store, meshRunId, recipient, message);
+        scheduler.handlingConversations.set(recipient.id, message.conversationId);
+        let outcome: Awaited<ReturnType<typeof deliverMessage>>;
+        try {
+          outcome = await deliverMessage(
+            scheduler,
+            appServer,
+            store,
+            meshRunId,
+            recipient,
+            message,
+          );
+        } finally {
+          scheduler.handlingConversations.delete(recipient.id);
+        }
         if (outcome === "ambiguous") {
           return;
         }
+      }
+    }
+    const notices = scheduler.noticeQueues.get(recipient.id);
+    if (notices && notices.length > 0 && recipient.status === "unloaded") {
+      if (!recipient.threadId) {
+        return;
+      }
+      await appServer.resumeThread(recipient.threadId);
+      recipient.status = "idle";
+      store.updateAgentStatus(meshRunId, recipient);
+    }
+    while (notices && notices.length > 0 && recipient.status === "idle") {
+      const notice = notices.shift();
+      if (!notice || !recipient.threadId) {
+        return;
+      }
+      recipient.status = "working";
+      store.updateAgentStatus(meshRunId, recipient);
+      try {
+        const handling = await appServer.startNotice({
+          threadId: recipient.threadId,
+          notice,
+        });
+        await handling.completed;
+      } finally {
+        recipient.status = "idle";
+        store.updateAgentStatus(meshRunId, recipient);
       }
     }
   } finally {
@@ -458,7 +532,43 @@ async function drainRecipientQueue(
   }
 }
 
-function notification(
+function queueSupervisorNotice(
+  scheduler: DeliveryScheduler,
+  appServer: AppServerAdapter,
+  store: TranscriptStore,
+  message: Message,
+  reason: string,
+): void {
+  const recipientAgentId =
+    message.kind === "reply" ? message.recipientAgentId : message.senderAgentId;
+  enqueueSupervisorNotice(
+    scheduler,
+    appServer,
+    store,
+    store.recordSupervisorNotice(message, reason, recipientAgentId),
+  );
+}
+
+function enqueueSupervisorNotice(
+  scheduler: DeliveryScheduler,
+  appServer: AppServerAdapter,
+  store: TranscriptStore,
+  notice: SupervisorNotice,
+): void {
+  const recipient = scheduler.agents.find((agent) => agent.id === notice.recipientAgentId);
+  if (!recipient) {
+    return;
+  }
+  const queue = scheduler.noticeQueues.get(recipient.id) ?? [];
+  scheduler.noticeQueues.set(recipient.id, queue);
+  queue.push(notice);
+  if (recipient.status === "idle" || recipient.status === "unloaded") {
+    scheduleDelivery(scheduler, appServer, store, scheduler.meshRunId, recipient);
+  }
+}
+
+function peerMessage(
+  kind: "notification" | "question",
   id: string,
   conversationId: string,
   senderAgentId: string,
@@ -468,7 +578,7 @@ function notification(
 ): Message {
   return {
     id,
-    kind: "notification",
+    kind,
     senderAgentId,
     recipientAgentId,
     conversationId,
@@ -478,7 +588,8 @@ function notification(
   };
 }
 
-async function deliverNotification(
+async function deliverMessage(
+  scheduler: DeliveryScheduler,
   appServer: AppServerAdapter,
   store: TranscriptStore,
   meshRunId: string,
@@ -488,7 +599,13 @@ async function deliverNotification(
   if (!recipient.threadId) {
     return "ambiguous";
   }
-  store.markDeliveryInjecting(message);
+  if (!store.markDeliveryInjecting(message)) {
+    store.cancelDelivery(
+      message,
+      "Delivery cancelled because its Conversation is already terminal.",
+    );
+    return "idle";
+  }
   recipient.status = "working";
   store.updateAgentStatus(meshRunId, recipient);
   let handling: Awaited<ReturnType<AppServerAdapter["startHandling"]>>;
@@ -501,19 +618,67 @@ async function deliverNotification(
     const messageText = failureMessage(cause);
     if (cause instanceof HandlingStartError && cause.acceptance === "rejected") {
       store.rejectDelivery(message, messageText);
+      if (message.kind === "question" || message.kind === "reply") {
+        queueSupervisorNotice(scheduler, appServer, store, message, messageText);
+      }
       recipient.status = "idle";
       store.updateAgentStatus(meshRunId, recipient);
       return "idle";
     }
     store.failDelivery(message, messageText);
+    if (message.kind === "question" || message.kind === "reply") {
+      queueSupervisorNotice(scheduler, appServer, store, message, messageText);
+    }
     return "ambiguous";
   }
   store.markHandlingActive(message, handling.turnId);
   try {
     const completion = await handling.completed;
-    store.completeNotificationHandling(message, handling.turnId, completion.finalOutput);
+    if (message.kind === "question") {
+      const finalOutput = completion.finalOutput?.trim();
+      if (!finalOutput) {
+        enqueueSupervisorNotice(
+          scheduler,
+          appServer,
+          store,
+          store.failQuestionWithoutReply(message, handling.turnId),
+        );
+      } else {
+        const reply: Message = {
+          id: scheduler.generateOpaqueValue(),
+          kind: "reply",
+          senderAgentId: message.recipientAgentId,
+          recipientAgentId: message.senderAgentId,
+          conversationId: message.conversationId,
+          createdAt: new Date().toISOString(),
+          body: finalOutput,
+          inReplyTo: message.id,
+        };
+        const replyRecipient = scheduler.agents.find(
+          (agent) => agent.id === reply.recipientAgentId,
+        );
+        if (!replyRecipient) {
+          queueSupervisorNotice(
+            scheduler,
+            appServer,
+            store,
+            message,
+            "Question asker is unavailable for Reply delivery.",
+          );
+          store.failHandling(message, handling.turnId, "Question asker is unavailable.");
+        } else {
+          store.completeQuestionWithReply(message, handling.turnId, finalOutput, reply);
+          enqueueNotification(scheduler, appServer, store, meshRunId, replyRecipient, reply);
+        }
+      }
+    } else {
+      store.completeNotificationHandling(message, handling.turnId, completion.finalOutput);
+    }
   } catch (cause) {
     store.failHandling(message, handling.turnId, failureMessage(cause));
+    if (message.kind === "question" || message.kind === "reply") {
+      queueSupervisorNotice(scheduler, appServer, store, message, failureMessage(cause));
+    }
   }
   recipient.status = "idle";
   store.updateAgentStatus(meshRunId, recipient);
