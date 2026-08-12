@@ -41,13 +41,23 @@ export async function runCli(
   if (command === "cancel") {
     return runCancel(options, io, supervisor);
   }
+  if (command === "inspect") {
+    return runInspect(options, io, supervisor);
+  }
+  if (command === "logs") {
+    return runLogs(options, io, supervisor);
+  }
+  if (command === "purge") {
+    return runPurge(options, io, supervisor);
+  }
   if (command !== "start") {
     return writeError(io, {
       status: "rejected",
       errors: [
         {
           code: "cli.command_invalid",
-          message: "Usage: codex-meshd <start|requests|respond|cancel> [options]",
+          message:
+            "Usage: codex-meshd <start|requests|respond|cancel|inspect|logs|purge> [options]",
         },
       ],
     });
@@ -68,6 +78,80 @@ export async function runCli(
   }
   io.stdout.write(`${JSON.stringify(result)}\n`);
   return 0;
+}
+
+async function runInspect(
+  options: string[],
+  io: CliIo,
+  supervisor: Supervisor | undefined,
+): Promise<number> {
+  const cwd = readOption(options, "--cwd") ?? process.cwd();
+  const meshRunId = readOption(options, "--mesh-run");
+  try {
+    const evidence = await (supervisor ?? createSupervisor()).inspectEvidence({
+      cwd,
+      ...(meshRunId ? { meshRunId } : {}),
+    });
+    io.stdout.write(`${JSON.stringify({ evidence })}\n`);
+    return 0;
+  } catch (cause) {
+    return writeCliError(
+      io,
+      cause instanceof Error ? cause.message : "Evidence inspection failed.",
+    );
+  }
+}
+
+async function runLogs(
+  options: string[],
+  io: CliIo,
+  supervisor: Supervisor | undefined,
+): Promise<number> {
+  const cwd = readOption(options, "--cwd") ?? process.cwd();
+  const meshRunId = readOption(options, "--mesh-run");
+  const afterValue = readOption(options, "--after");
+  const afterSequence = afterValue === undefined ? 0 : Number(afterValue);
+  if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
+    return writeCliError(io, "--after must be a non-negative safe integer.");
+  }
+  const follow = options.includes("--follow");
+  const service = supervisor ?? createSupervisor();
+  let cursor = afterSequence;
+  try {
+    do {
+      const events = await service.listStructuredEvents({
+        cwd,
+        afterSequence: cursor,
+        ...(meshRunId ? { meshRunId } : {}),
+      });
+      for (const event of events) {
+        io.stdout.write(`${JSON.stringify(event)}\n`);
+        cursor = event.sequence;
+      }
+      if (follow) {
+        await Bun.sleep(250);
+      }
+    } while (follow);
+    return 0;
+  } catch (cause) {
+    return writeCliError(io, cause instanceof Error ? cause.message : "Structured log failed.");
+  }
+}
+
+async function runPurge(
+  options: string[],
+  io: CliIo,
+  supervisor: Supervisor | undefined,
+): Promise<number> {
+  const cwd = readOption(options, "--cwd") ?? process.cwd();
+  const confirmed = options.includes("--confirm");
+  try {
+    const result = await (supervisor ?? createSupervisor()).purgeEvidence({ cwd, confirmed });
+    io.stdout.write(`${JSON.stringify(result)}\n`);
+    return 0;
+  } catch (cause) {
+    return writeCliError(io, cause instanceof Error ? cause.message : "Evidence purge failed.");
+  }
 }
 
 async function runRespond(

@@ -92,6 +92,23 @@ export interface ConversationSnapshot {
   events: TranscriptEvent[];
 }
 
+export interface StructuredTranscriptEvent extends TranscriptEvent {
+  meshRunId: string;
+  conversationId: string;
+}
+
+export interface EvidenceSnapshot {
+  meshRuns: MeshRun[];
+  agents: Array<PublicAgent & { meshRunId: string }>;
+  conversations: Array<{ id: string; meshRunId: string; status: ConversationSnapshot["status"] }>;
+  messages: Message[];
+  deliveries: Delivery[];
+  handlings: Handling[];
+  notices: SupervisorNotice[];
+  operatorRequests: OperatorRequest[];
+  events: StructuredTranscriptEvent[];
+}
+
 export interface SupervisorNotice {
   id: number;
   recipientAgentId: string;
@@ -1060,6 +1077,93 @@ export class TranscriptStore {
       })),
       ...(run.failure_message === null ? {} : { failureMessage: run.failure_message }),
     };
+  }
+
+  inspectEvidence(meshRunId?: string): EvidenceSnapshot {
+    const meshRunRows = (
+      meshRunId
+        ? this.database.query("SELECT id FROM mesh_runs WHERE id = ? ORDER BY rowid").all(meshRunId)
+        : this.database.query("SELECT id FROM mesh_runs ORDER BY rowid").all()
+    ) as Array<{ id: string }>;
+    const meshRuns = meshRunRows.flatMap(({ id }) => {
+      const run = this.inspectMeshRun(id);
+      return run ? [run] : [];
+    });
+    const conversationRows = (
+      meshRunId
+        ? this.database
+            .query(
+              `SELECT id, mesh_run_id, status FROM conversations
+               WHERE mesh_run_id = ? ORDER BY rowid`,
+            )
+            .all(meshRunId)
+        : this.database
+            .query("SELECT id, mesh_run_id, status FROM conversations ORDER BY rowid")
+            .all()
+    ) as Array<{
+      id: string;
+      mesh_run_id: string;
+      status: ConversationSnapshot["status"];
+    }>;
+    const snapshots = conversationRows.flatMap(({ id }) => {
+      const snapshot = this.inspectConversation(id);
+      return snapshot ? [snapshot] : [];
+    });
+    return {
+      meshRuns,
+      agents: meshRuns.flatMap((run) =>
+        run.agents.map((agent) => ({ ...agent, meshRunId: run.id })),
+      ),
+      conversations: conversationRows.map((row) => ({
+        id: row.id,
+        meshRunId: row.mesh_run_id,
+        status: row.status,
+      })),
+      messages: snapshots.flatMap(({ messages }) => messages),
+      deliveries: snapshots.flatMap(({ deliveries }) => deliveries),
+      handlings: snapshots.flatMap(({ handlings }) => handlings),
+      notices: snapshots.flatMap(({ notices }) => notices),
+      operatorRequests: this.listOperatorRequests(meshRunId),
+      events: this.listStructuredEvents(meshRunId),
+    };
+  }
+
+  listStructuredEvents(meshRunId?: string, afterSequence = 0): StructuredTranscriptEvent[] {
+    const rows = (
+      meshRunId
+        ? this.database
+            .query(
+              `SELECT event.sequence, conversation.mesh_run_id, event.conversation_id,
+                      event.type, event.created_at
+               FROM transcript_events AS event
+               JOIN conversations AS conversation ON conversation.id = event.conversation_id
+               WHERE conversation.mesh_run_id = ? AND event.sequence > ?
+               ORDER BY event.sequence`,
+            )
+            .all(meshRunId, afterSequence)
+        : this.database
+            .query(
+              `SELECT event.sequence, conversation.mesh_run_id, event.conversation_id,
+                      event.type, event.created_at
+               FROM transcript_events AS event
+               JOIN conversations AS conversation ON conversation.id = event.conversation_id
+               WHERE event.sequence > ? ORDER BY event.sequence`,
+            )
+            .all(afterSequence)
+    ) as Array<{
+      sequence: number;
+      mesh_run_id: string;
+      conversation_id: string;
+      type: TranscriptEvent["type"];
+      created_at: string;
+    }>;
+    return rows.map((row) => ({
+      sequence: row.sequence,
+      meshRunId: row.mesh_run_id,
+      conversationId: row.conversation_id,
+      type: row.type,
+      createdAt: row.created_at,
+    }));
   }
 
   close(): void {

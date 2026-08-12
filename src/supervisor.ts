@@ -1,5 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { posix } from "node:path";
+import { rm } from "node:fs/promises";
+import { createConnection } from "node:net";
+import { join, posix } from "node:path";
 import {
   type AppServerAdapter,
   HandlingStartError,
@@ -25,10 +27,12 @@ import {
 import {
   type ConversationLimits,
   type ConversationSnapshot,
+  type EvidenceSnapshot,
   type MeshRun,
   type Message,
   type NotificationContext,
   type OperatorRequest,
+  type StructuredTranscriptEvent,
   type SupervisorNotice,
   TranscriptStore,
 } from "./transcript-store.ts";
@@ -70,6 +74,13 @@ export interface Supervisor {
     cwd: string;
     conversationId: string;
   }): Promise<ConversationSnapshot | undefined>;
+  inspectEvidence(request: { cwd: string; meshRunId?: string }): Promise<EvidenceSnapshot>;
+  listStructuredEvents(request: {
+    cwd: string;
+    meshRunId?: string;
+    afterSequence?: number;
+  }): Promise<StructuredTranscriptEvent[]>;
+  purgeEvidence(request: { cwd: string; confirmed: boolean }): Promise<{ status: "purged" }>;
   listOperatorRequests(request: { cwd: string; meshRunId?: string }): Promise<OperatorRequest[]>;
   respondToOperatorRequest(request: {
     meshRunId: string;
@@ -498,6 +509,51 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
       }
     },
 
+    async inspectEvidence(request): Promise<EvidenceSnapshot> {
+      const repository = await resolveRepositoryIdentity(request.cwd);
+      if (!repository) {
+        throw new Error("Evidence inspection requires a Git Repository.");
+      }
+      const store = await TranscriptStore.open(repository.rootDirectory);
+      try {
+        return store.inspectEvidence(request.meshRunId);
+      } finally {
+        store.close();
+      }
+    },
+
+    async listStructuredEvents(request): Promise<StructuredTranscriptEvent[]> {
+      const repository = await resolveRepositoryIdentity(request.cwd);
+      if (!repository) {
+        throw new Error("Structured log inspection requires a Git Repository.");
+      }
+      const store = await TranscriptStore.open(repository.rootDirectory);
+      try {
+        return store.listStructuredEvents(request.meshRunId, request.afterSequence ?? 0);
+      } finally {
+        store.close();
+      }
+    },
+
+    async purgeEvidence(request): Promise<{ status: "purged" }> {
+      if (!request.confirmed) {
+        throw new Error("Evidence purge requires explicit confirmation.");
+      }
+      const repository = await resolveRepositoryIdentity(request.cwd);
+      if (!repository) {
+        throw new Error("Evidence purge requires a Git Repository.");
+      }
+      if (active) {
+        throw new Error("Evidence cannot be purged while this Supervisor is active.");
+      }
+      const stateDirectory = join(repository.rootDirectory, ".codex-meshd");
+      if (await isSupervisorSocketLive(join(stateDirectory, "supervisor.sock"))) {
+        throw new Error("Evidence cannot be purged while a Supervisor is active.");
+      }
+      await rm(stateDirectory, { recursive: true, force: true });
+      return { status: "purged" };
+    },
+
     async listOperatorRequests(request): Promise<OperatorRequest[]> {
       const repository = await resolveRepositoryIdentity(request.cwd);
       if (!repository) {
@@ -627,6 +683,26 @@ interface ActiveHandling {
   threadId: string;
   turnId: string;
   message: Message;
+}
+
+async function isSupervisorSocketLive(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection(socketPath);
+    let settled = false;
+    const settle = (live: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(live);
+    };
+    socket.once("connect", () => settle(true));
+    socket.once("error", (cause: NodeJS.ErrnoException) =>
+      settle(cause.code !== "ENOENT" && cause.code !== "ECONNREFUSED"),
+    );
+    socket.setTimeout(250, () => settle(true));
+  });
 }
 
 const MAX_QUEUED_MESSAGES_PER_AGENT = 32;

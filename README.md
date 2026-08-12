@@ -40,6 +40,12 @@ adapters receive distinct credentials and cannot use Operator operations.
 - `codex-meshd respond --cwd <repository> --mesh-run <id> --request <id> --decision approved|denied` for approvals.
 - `codex-meshd respond --cwd <repository> --mesh-run <id> --request <id> --answer <text>` for requested input.
 - `codex-meshd cancel --cwd <repository> --mesh-run <id> --conversation <id>` to cancel one Conversation. Cancellation cannot undo completed filesystem or external effects.
+- `codex-meshd inspect --cwd <repository> [--mesh-run <id>]` to print the complete SQLite-backed evidence snapshot.
+- `codex-meshd logs --cwd <repository> [--mesh-run <id>] [--after <sequence>] [--follow]` to stream the same structured Conversation events used by behavioral tests.
+- `codex-meshd purge --cwd <repository> --confirm` to explicitly remove retained local evidence. Purge refuses to run while a Supervisor is active.
+
+The ignored `.codex-meshd/` state directory and its database and private socket are owner-only.
+Normal shutdown retains the Transcript; only the explicit confirmed purge removes it.
 
 ## Documentation
 
