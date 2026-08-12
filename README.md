@@ -11,6 +11,8 @@
 > boundary. Causal Conversations enforce duplicate, Message-count, and five-minute deadline
 > controls without reopening terminal work. Operator Requests pause those deadlines until an
 > explicit response, and selected Conversations can be cancelled without stopping unrelated work.
+> Unexpected app-server loss fails open work without replay, while the next startup terminalizes
+> stale Mesh evidence as `supervisor_lost` before creating fresh Agent and thread identities.
 > The Operator CLI does not yet connect to a real Codex app-server.
 
 ## Confirmed v0

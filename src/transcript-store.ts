@@ -349,6 +349,114 @@ export class TranscriptStore {
     update();
   }
 
+  failStaleMeshRuns(repositoryId: string): string[] {
+    const staleRuns = this.database
+      .query(
+        `SELECT id FROM mesh_runs
+         WHERE repository_id = ? AND status IN ('starting', 'running') ORDER BY rowid`,
+      )
+      .all(repositoryId) as Array<{ id: string }>;
+    for (const { id } of staleRuns) {
+      this.failMeshRunWithoutReplay(id, "supervisor_lost");
+    }
+    return staleRuns.map(({ id }) => id);
+  }
+
+  failMeshRunWithoutReplay(meshRunId: string, reason: string): boolean {
+    let failed = false;
+    const fail = this.database.transaction(() => {
+      const mesh = this.database
+        .query(
+          `UPDATE mesh_runs SET status = 'failed', failure_message = ?
+           WHERE id = ? AND status IN ('starting', 'running')`,
+        )
+        .run(reason, meshRunId);
+      if (mesh.changes !== 1) {
+        return;
+      }
+      failed = true;
+      const conversations = this.database
+        .query(
+          `SELECT id FROM conversations
+           WHERE mesh_run_id = ? AND status = 'open' ORDER BY rowid`,
+        )
+        .all(meshRunId) as Array<{ id: string }>;
+      for (const { id: conversationId } of conversations) {
+        const injecting = this.database
+          .query(
+            `SELECT deliveries.message_id
+             FROM deliveries JOIN messages ON messages.id = deliveries.message_id
+             WHERE messages.conversation_id = ? AND deliveries.status = 'injecting'`,
+          )
+          .all(conversationId) as Array<{ message_id: string }>;
+        for (const { message_id: messageId } of injecting) {
+          this.database
+            .query(
+              `UPDATE deliveries SET status = 'ambiguous', failure_message = ?
+               WHERE message_id = ? AND status = 'injecting'`,
+            )
+            .run(reason, messageId);
+          this.recordEvent(conversationId, "delivery.ambiguous");
+        }
+        const pending = this.pendingDeliveryIds(conversationId);
+        for (const messageId of pending) {
+          this.database
+            .query(
+              `UPDATE deliveries SET status = 'cancelled', failure_message = ?
+               WHERE message_id = ?`,
+            )
+            .run(reason, messageId);
+          this.recordEvent(conversationId, "delivery.cancelled");
+        }
+        const activeHandlings = this.database
+          .query(
+            `SELECT handlings.message_id
+             FROM handlings JOIN messages ON messages.id = handlings.message_id
+             WHERE messages.conversation_id = ? AND handlings.status = 'active'`,
+          )
+          .all(conversationId) as Array<{ message_id: string }>;
+        for (const { message_id: messageId } of activeHandlings) {
+          this.database
+            .query(
+              `UPDATE handlings SET status = 'failed', failure_message = ?
+               WHERE message_id = ? AND status = 'active'`,
+            )
+            .run(reason, messageId);
+          this.recordEvent(conversationId, "handling.failed");
+        }
+        const affectedAgents = this.database
+          .query(
+            `SELECT sender_agent_id AS agent_id FROM messages WHERE conversation_id = ?
+             UNION SELECT recipient_agent_id AS agent_id FROM messages WHERE conversation_id = ?`,
+          )
+          .all(conversationId, conversationId) as Array<{ agent_id: string }>;
+        for (const { agent_id: agentId } of affectedAgents) {
+          this.database
+            .query(
+              `INSERT INTO supervisor_notices
+                (recipient_agent_id, conversation_id, reason, created_at) VALUES (?, ?, ?, ?)`,
+            )
+            .run(agentId, conversationId, reason, new Date().toISOString());
+        }
+        this.database
+          .query("UPDATE conversations SET status = 'failed' WHERE id = ? AND status = 'open'")
+          .run(conversationId);
+        this.recordEvent(conversationId, "conversation.failed");
+      }
+      this.database
+        .query(
+          `UPDATE operator_requests SET status = 'cancelled', failure_message = ?, resolved_at = ?
+           WHERE mesh_run_id = ? AND status IN ('pending', 'responding', 'delivery_failed')`,
+        )
+        .run(reason, new Date().toISOString(), meshRunId);
+      this.database
+        .query("UPDATE agents SET status = 'stopped' WHERE mesh_run_id = ?")
+        .run(meshRunId);
+    });
+    fail();
+    return failed;
+  }
+
   markStopped(meshRunId: string): void {
     const update = this.database.transaction(() => {
       this.database

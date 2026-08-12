@@ -105,6 +105,7 @@ interface ActiveMeshRun {
   store: TranscriptStore;
   unsubscribeFromThreadStatus: () => void;
   unsubscribeFromOperatorWaits: () => void;
+  unsubscribeFromUnexpectedExit: () => void;
   cancelDeadlines: () => void;
   scheduler: DeliveryScheduler;
 }
@@ -134,6 +135,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
   const scheduleDeadline = options.scheduleDeadline ?? defaultDeadlineScheduler;
   const conversationLimits = normalizedConversationLimits(options.conversationLimits);
   const configuredOperatorCredential = options.operatorCredential;
+  let pendingFailureCleanup: Promise<void> | undefined;
   let active: ActiveMeshRun | undefined;
 
   return {
@@ -149,6 +151,8 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           ],
         };
       }
+      await pendingFailureCleanup;
+      pendingFailureCleanup = undefined;
 
       const validation = await validateStartup(request.cwd, request.configurationPath);
       if (!validation.ok) {
@@ -167,6 +171,8 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
       let discoveryServer: DiscoveryServer | undefined;
       let unsubscribeFromThreadStatus: (() => void) | undefined;
       let unsubscribeFromOperatorWaits: (() => void) | undefined;
+      let unsubscribeFromUnexpectedExit: (() => void) | undefined;
+      let startupUnexpectedExitReason: string | undefined;
       let meshRunRecorded = false;
       const scheduler: DeliveryScheduler = {
         queues: new Map(),
@@ -186,10 +192,12 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         activeHandlings: new Map(),
         startingHandlings: new Map(),
         pendingWaitIdsByConversation: new Map(),
+        stopped: false,
       };
 
       try {
         store = await TranscriptStore.open(validation.repository.rootDirectory);
+        store.failStaleMeshRuns(validation.repository.id);
         store.createMeshRun({
           id: meshRunId,
           repositoryId: validation.repository.id,
@@ -204,6 +212,9 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           callerAgentId: string,
           input: SendNotificationInput,
         ): Promise<string> => {
+          if (scheduler.stopped) {
+            throw new Error("Mesh Run is stopped.");
+          }
           if (!store) {
             throw new Error("Transcript is unavailable.");
           }
@@ -314,6 +325,34 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
             recordOperatorWait(scheduler, store, meshRunId, operatorWait);
           }
         });
+        unsubscribeFromUnexpectedExit = appServer.onUnexpectedExit((reason) => {
+          const failing = active;
+          if (!failing) {
+            startupUnexpectedExitReason = `app_server_lost: ${reason}`;
+            scheduler.stopped = true;
+            return;
+          }
+          if (failing.id !== meshRunId) {
+            return;
+          }
+          active = undefined;
+          failing.scheduler.stopped = true;
+          failing.unsubscribeFromThreadStatus();
+          failing.unsubscribeFromOperatorWaits();
+          failing.unsubscribeFromUnexpectedExit();
+          failing.cancelDeadlines();
+          failing.store.failMeshRunWithoutReplay(meshRunId, `app_server_lost: ${reason}`);
+          for (const agent of failing.scheduler.agents) {
+            agent.status = "stopped";
+          }
+          failing.scheduler.queues.clear();
+          failing.scheduler.noticeQueues.clear();
+          failing.scheduler.queuedMessageIds.clear();
+          pendingFailureCleanup = failing.discoveryServer
+            .close()
+            .catch(() => {})
+            .finally(() => failing.store.close());
+        });
         for (const runtime of agentRuntime) {
           const thread = await appServer.startThread({
             ...runtime.configuration,
@@ -324,6 +363,9 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           });
           if (!thread.mcpReady) {
             throw new Error(`MCP connection for Agent ${runtime.agent.name} is not ready.`);
+          }
+          if (startupUnexpectedExitReason) {
+            throw new Error(startupUnexpectedExitReason);
           }
           runtime.agent.threadId = thread.threadId;
         }
@@ -343,6 +385,9 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           objective: writer.agent.objective,
           roster: agents,
         });
+        if (startupUnexpectedExitReason) {
+          throw new Error(startupUnexpectedExitReason);
+        }
         store.markRunning(meshRunId, agents);
         const meshRun = store.inspectMeshRun(meshRunId);
         if (!meshRun) {
@@ -355,6 +400,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           store,
           unsubscribeFromThreadStatus,
           unsubscribeFromOperatorWaits,
+          unsubscribeFromUnexpectedExit,
           cancelDeadlines: () => cancelAllConversationDeadlines(scheduler),
           scheduler,
         };
@@ -364,13 +410,18 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           cause instanceof Error ? cause.message : "Unknown startup prerequisite failure.";
         if (store && meshRunRecorded) {
           try {
-            store.markFailed(meshRunId, message);
+            if (startupUnexpectedExitReason) {
+              store.failMeshRunWithoutReplay(meshRunId, startupUnexpectedExitReason);
+            } else {
+              store.markFailed(meshRunId, message);
+            }
           } catch {
             // Preserve the original prerequisite failure when the Transcript is also unhealthy.
           }
         }
         unsubscribeFromThreadStatus?.();
         unsubscribeFromOperatorWaits?.();
+        unsubscribeFromUnexpectedExit?.();
         cancelAllConversationDeadlines(scheduler);
         await closeAfterFailedStart(appServer, discoveryServer, store);
         return {
@@ -393,6 +444,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
       try {
         stopping.unsubscribeFromThreadStatus();
         stopping.unsubscribeFromOperatorWaits();
+        stopping.unsubscribeFromUnexpectedExit();
         stopping.cancelDeadlines();
         try {
           await stopping.appServer.close();
@@ -561,6 +613,7 @@ interface DeliveryScheduler {
   activeHandlings: Map<string, ActiveHandling>;
   startingHandlings: Map<string, Message>;
   pendingWaitIdsByConversation: Map<string, Set<string>>;
+  stopped: boolean;
 }
 
 interface ConversationDeadlineState {
@@ -707,6 +760,9 @@ function scheduleAllDeliveries(
   appServer: AppServerAdapter,
   store: TranscriptStore,
 ): void {
+  if (scheduler.stopped) {
+    return;
+  }
   for (const agent of scheduler.agents) {
     if (agent.status === "idle" || agent.status === "unloaded") {
       scheduleDelivery(scheduler, appServer, store, scheduler.meshRunId, agent);
@@ -800,11 +856,17 @@ async function respondToOperatorRequestCore(
   try {
     await appServer.respondToOperatorWait(requestId, response);
   } catch (cause) {
+    if (scheduler.stopped) {
+      throw cause;
+    }
     store.failOperatorRequestResponse(requestId, failureMessage(cause));
     if (responding.conversationId) {
       restoreConversationWait(scheduler, responding.conversationId, responding.id);
     }
     throw cause;
+  }
+  if (scheduler.stopped) {
+    throw new Error(`Mesh Run ${requestedMeshRunId} stopped during Operator response delivery.`);
   }
   const resolved = store.completeOperatorRequestResponse(requestId);
   if (!resolved) {
@@ -838,11 +900,13 @@ async function cancelConversationCore(
     try {
       await appServer.interruptTurn(handling.threadId, handling.turnId);
     } catch (cause) {
-      store.failInterruptedHandling(
-        handling.message,
-        handling.turnId,
-        `Operator cancellation was recorded, but turn interruption failed: ${failureMessage(cause)}`,
-      );
+      if (!scheduler.stopped) {
+        store.failInterruptedHandling(
+          handling.message,
+          handling.turnId,
+          `Operator cancellation was recorded, but turn interruption failed: ${failureMessage(cause)}`,
+        );
+      }
     }
   }
   scheduleAllDeliveries(scheduler, appServer, store);
@@ -919,6 +983,9 @@ function scheduleDelivery(
   meshRunId: string,
   recipient: PublicAgent,
 ): void {
+  if (scheduler.stopped) {
+    return;
+  }
   queueMicrotask(() => {
     void drainRecipientQueue(scheduler, appServer, store, meshRunId, recipient).catch(() => {});
   });
@@ -931,6 +998,9 @@ async function drainRecipientQueue(
   meshRunId: string,
   recipient: PublicAgent,
 ): Promise<void> {
+  if (scheduler.stopped) {
+    return;
+  }
   if (scheduler.delivering.has(recipient.id) || recipient.status === "working") {
     return;
   }
@@ -955,6 +1025,9 @@ async function drainRecipientQueue(
         try {
           await appServer.resumeThread(recipient.threadId);
         } catch (cause) {
+          if (scheduler.stopped) {
+            return;
+          }
           const message = failureMessage(cause);
           for (const failedMessage of queue.splice(0)) {
             scheduler.queuedMessageIds.delete(failedMessage.id);
@@ -988,6 +1061,9 @@ async function drainRecipientQueue(
         } finally {
           scheduler.handlingConversations.delete(recipient.id);
         }
+        if (scheduler.stopped) {
+          return;
+        }
         if (!store.isConversationOpen(message.conversationId)) {
           cancelConversationDeadline(scheduler, message.conversationId);
           purgeTerminalConversationFromScheduler(scheduler, store, message.conversationId);
@@ -1003,6 +1079,9 @@ async function drainRecipientQueue(
         return;
       }
       await appServer.resumeThread(recipient.threadId);
+      if (scheduler.stopped) {
+        return;
+      }
       recipient.status = "idle";
       store.updateAgentStatus(meshRunId, recipient);
     }
@@ -1020,8 +1099,10 @@ async function drainRecipientQueue(
         });
         await handling.completed;
       } finally {
-        recipient.status = "idle";
-        store.updateAgentStatus(meshRunId, recipient);
+        if (!scheduler.stopped) {
+          recipient.status = "idle";
+          store.updateAgentStatus(meshRunId, recipient);
+        }
       }
     }
   } finally {
@@ -1115,6 +1196,9 @@ async function deliverMessage(
     });
   } catch (cause) {
     scheduler.startingHandlings.delete(recipient.threadId);
+    if (scheduler.stopped) {
+      return "ambiguous";
+    }
     const messageText = failureMessage(cause);
     if (cause instanceof HandlingStartError && cause.acceptance === "rejected") {
       store.rejectDelivery(message, messageText);
@@ -1132,6 +1216,10 @@ async function deliverMessage(
     return "ambiguous";
   }
   scheduler.startingHandlings.delete(recipient.threadId);
+  if (scheduler.stopped) {
+    void handling.completed.catch(() => {});
+    return "ambiguous";
+  }
   if (!store.isConversationOpen(message.conversationId)) {
     store.markHandlingActive(message, handling.turnId);
     store.interruptHandling(message, handling.turnId);
@@ -1156,6 +1244,9 @@ async function deliverMessage(
   });
   try {
     const completion = await handling.completed;
+    if (scheduler.stopped) {
+      return "ambiguous";
+    }
     if (
       store.expireConversation(
         message.conversationId,
@@ -1219,6 +1310,9 @@ async function deliverMessage(
       store.completeHandling(message, handling.turnId, completion.finalOutput);
     }
   } catch (cause) {
+    if (scheduler.stopped) {
+      return "ambiguous";
+    }
     store.failHandling(message, handling.turnId, failureMessage(cause));
     if (message.kind === "question" || message.kind === "reply") {
       queueSupervisorNotice(scheduler, appServer, store, message, failureMessage(cause));

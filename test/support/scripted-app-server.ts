@@ -1,5 +1,6 @@
 import type {
   AppServerAdapter,
+  AppServerExitListener,
   HandlingCompletion,
   HandlingHandle,
   OperatorWaitListener,
@@ -44,12 +45,14 @@ export class ScriptedAppServer implements AppServerAdapter {
   statusSubscriptionCount = 0;
   readonly #statusListeners = new Set<ThreadStatusListener>();
   readonly #operatorWaitListeners = new Set<OperatorWaitListener>();
+  readonly #exitListeners = new Set<AppServerExitListener>();
   #handlingCompletion: ReturnType<typeof Promise.withResolvers<HandlingCompletion>> | undefined;
   #nextHandlingFailure: ScriptedFailure | undefined;
   #waitOnNextHandlingStart: OperatorWaitRequest | undefined;
   #operatorResponseObserver: (() => Promise<void>) | undefined;
   #nextOperatorResponseFailure: string | undefined;
   #handlingStartGate: ReturnType<typeof Promise.withResolvers<void>> | undefined;
+  #nextThreadStartExit: string | undefined;
 
   constructor(private readonly failure?: ScriptedFailure) {}
 
@@ -69,6 +72,12 @@ export class ScriptedAppServer implements AppServerAdapter {
     }
   }
 
+  emitUnexpectedExit(reason = "scripted app-server exit"): void {
+    for (const listener of this.#exitListeners) {
+      listener(reason);
+    }
+  }
+
   waitOnNextHandlingStart(request: OperatorWaitRequest): void {
     this.#waitOnNextHandlingStart = request;
   }
@@ -79,6 +88,10 @@ export class ScriptedAppServer implements AppServerAdapter {
 
   failNextOperatorResponse(message: string): void {
     this.#nextOperatorResponseFailure = message;
+  }
+
+  exitOnNextThreadStart(reason: string): void {
+    this.#nextThreadStartExit = reason;
   }
 
   holdHandlings(): void {
@@ -121,6 +134,11 @@ export class ScriptedAppServer implements AppServerAdapter {
 
   async startThread(request: StartThreadRequest): Promise<ThreadHandle> {
     this.calls.push({ operation: "start-thread", request });
+    if (this.#nextThreadStartExit) {
+      const reason = this.#nextThreadStartExit;
+      this.#nextThreadStartExit = undefined;
+      this.emitUnexpectedExit(reason);
+    }
     if (`${request.role}-thread` === this.failure) {
       throw new Error(`scripted ${request.role} thread failure`);
     }
@@ -206,6 +224,11 @@ export class ScriptedAppServer implements AppServerAdapter {
   onOperatorWait(listener: OperatorWaitListener): () => void {
     this.#operatorWaitListeners.add(listener);
     return () => this.#operatorWaitListeners.delete(listener);
+  }
+
+  onUnexpectedExit(listener: AppServerExitListener): () => void {
+    this.#exitListeners.add(listener);
+    return () => this.#exitListeners.delete(listener);
   }
 
   async close(): Promise<void> {

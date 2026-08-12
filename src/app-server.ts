@@ -60,6 +60,7 @@ export type OperatorWaitResponse =
   | { type: "input"; answer: string };
 
 export type OperatorWaitListener = (request: OperatorWaitRequest) => void;
+export type AppServerExitListener = (reason: string) => void;
 
 export class HandlingStartError extends Error {
   constructor(
@@ -82,6 +83,7 @@ export interface AppServerAdapter {
   interruptTurn(threadId: string, turnId: string): Promise<void>;
   onThreadStatusChanged(listener: ThreadStatusListener): () => void;
   onOperatorWait(listener: OperatorWaitListener): () => void;
+  onUnexpectedExit(listener: AppServerExitListener): () => void;
   close(): Promise<void>;
 }
 
@@ -118,6 +120,9 @@ export function unavailableAppServerAdapter(): AppServerAdapter {
       return () => {};
     },
     onOperatorWait(): () => void {
+      return () => {};
+    },
+    onUnexpectedExit(): () => void {
       return () => {};
     },
     async close(): Promise<void> {},
