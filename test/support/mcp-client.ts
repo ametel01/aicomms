@@ -38,9 +38,31 @@ export class McpTestClient {
   }
 
   async request(method: string, params: unknown = {}): Promise<JsonRpcResponse> {
+    this.writeRequest(method, params);
+    this.#child.stdin.flush();
+    return this.readResponse();
+  }
+
+  async requestBatch(
+    requests: Array<{ method: string; params?: unknown }>,
+  ): Promise<JsonRpcResponse[]> {
+    for (const request of requests) {
+      this.writeRequest(request.method, request.params ?? {});
+    }
+    this.#child.stdin.flush();
+    const responses: JsonRpcResponse[] = [];
+    for (let index = 0; index < requests.length; index += 1) {
+      responses.push(await this.readResponse());
+    }
+    return responses;
+  }
+
+  private writeRequest(method: string, params: unknown): void {
     const id = ++this.#requestId;
     this.#child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-    this.#child.stdin.flush();
+  }
+
+  private async readResponse(): Promise<JsonRpcResponse> {
     for (;;) {
       const newline = this.#buffer.indexOf("\n");
       if (newline !== -1) {

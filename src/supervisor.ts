@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { isAbsolute, normalize } from "node:path";
 import {
   type AppServerAdapter,
   sandboxForRole,
@@ -18,7 +19,13 @@ import {
   type SupervisorErrorCode,
   validateStartup,
 } from "./startup-validation.ts";
-import { type MeshRun, TranscriptStore } from "./transcript-store.ts";
+import {
+  type ConversationSnapshot,
+  type MeshRun,
+  type Message,
+  type NotificationContext,
+  TranscriptStore,
+} from "./transcript-store.ts";
 
 export type {
   AgentConfiguration,
@@ -51,6 +58,10 @@ export interface Supervisor {
   start(request: StartMeshRequest): Promise<StartMeshResult>;
   stop(request: { meshRunId: string }): Promise<StopMeshResult>;
   inspectMeshRun(request: { cwd: string; meshRunId: string }): Promise<MeshRun | undefined>;
+  inspectConversation(request: {
+    cwd: string;
+    conversationId: string;
+  }): Promise<ConversationSnapshot | undefined>;
 }
 
 export interface SupervisorOptions {
@@ -100,6 +111,10 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
       let discoveryServer: DiscoveryServer | undefined;
       let unsubscribeFromThreadStatus: (() => void) | undefined;
       let meshRunRecorded = false;
+      const scheduler: DeliveryScheduler = {
+        queues: new Map(),
+        delivering: new Set(),
+      };
 
       try {
         store = await TranscriptStore.open(validation.repository.rootDirectory);
@@ -115,6 +130,30 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           validation.repository.rootDirectory,
           agentRuntime.map(({ agent, credential }) => ({ agentId: agent.id, credential })),
           agents,
+          {
+            sendNotification: async (callerAgentId, input) => {
+              if (!store) {
+                throw new Error("Transcript is unavailable.");
+              }
+              const transcript = store;
+              const validatedInput = validateNotificationInput(input);
+              const recipient = agents.find((agent) => agent.id === input.recipientAgentId);
+              if (!recipient?.threadId) {
+                throw new Error("Recipient Agent is unavailable.");
+              }
+              const message = notification(
+                generateOpaqueValue(),
+                generateOpaqueValue(),
+                callerAgentId,
+                validatedInput.recipientAgentId,
+                validatedInput.body,
+                validatedInput.context,
+              );
+              transcript.recordNotification(meshRunId, message);
+              enqueueNotification(scheduler, appServer, transcript, meshRunId, recipient, message);
+              return message.id;
+            },
+          },
         );
         await appServer.initialize();
         unsubscribeFromThreadStatus = appServer.onThreadStatusChanged((threadId, status) => {
@@ -124,6 +163,9 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           }
           agent.status = lifecycleStatus(status);
           store?.updateAgentStatus(meshRunId, agent);
+          if (agent.status === "idle" && store) {
+            scheduleDelivery(scheduler, appServer, store, meshRunId, agent);
+          }
         });
         for (const runtime of agentRuntime) {
           const thread = await appServer.startThread({
@@ -235,6 +277,19 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         store.close();
       }
     },
+
+    async inspectConversation(request): Promise<ConversationSnapshot | undefined> {
+      const repository = await resolveRepositoryIdentity(request.cwd);
+      if (!repository) {
+        return undefined;
+      }
+      const store = await TranscriptStore.open(repository.rootDirectory);
+      try {
+        return store.inspectConversation(request.conversationId);
+      } finally {
+        store.close();
+      }
+    },
   };
 }
 
@@ -280,7 +335,213 @@ async function closeAfterFailedStart(
 }
 
 function lifecycleStatus(
-  status: "active" | "idle" | "closed" | "system-error",
+  status: "active" | "idle" | "unloaded" | "closed" | "system-error",
 ): AgentLifecycleStatus {
-  return status === "active" ? "working" : status === "idle" ? "idle" : "stopped";
+  return status === "active"
+    ? "working"
+    : status === "idle"
+      ? "idle"
+      : status === "unloaded"
+        ? "unloaded"
+        : "stopped";
+}
+
+interface DeliveryScheduler {
+  queues: Map<string, Message[]>;
+  delivering: Set<string>;
+}
+
+function enqueueNotification(
+  scheduler: DeliveryScheduler,
+  appServer: AppServerAdapter,
+  store: TranscriptStore,
+  meshRunId: string,
+  recipient: PublicAgent,
+  message: Message,
+): void {
+  const queue = scheduler.queues.get(recipient.id) ?? [];
+  scheduler.queues.set(recipient.id, queue);
+  queue.push(message);
+  if (queue.length > 1 || scheduler.delivering.has(recipient.id) || recipient.status !== "idle") {
+    store.markDeliveryQueued(message);
+  }
+  if (recipient.status === "idle" || recipient.status === "unloaded") {
+    scheduleDelivery(scheduler, appServer, store, meshRunId, recipient);
+  }
+}
+
+function scheduleDelivery(
+  scheduler: DeliveryScheduler,
+  appServer: AppServerAdapter,
+  store: TranscriptStore,
+  meshRunId: string,
+  recipient: PublicAgent,
+): void {
+  queueMicrotask(() => {
+    void drainRecipientQueue(scheduler, appServer, store, meshRunId, recipient).catch(() => {});
+  });
+}
+
+async function drainRecipientQueue(
+  scheduler: DeliveryScheduler,
+  appServer: AppServerAdapter,
+  store: TranscriptStore,
+  meshRunId: string,
+  recipient: PublicAgent,
+): Promise<void> {
+  if (scheduler.delivering.has(recipient.id) || recipient.status === "working") {
+    return;
+  }
+  scheduler.delivering.add(recipient.id);
+  try {
+    const queue = scheduler.queues.get(recipient.id);
+    while (queue && queue.length > 0) {
+      if (recipient.status === "unloaded") {
+        if (!recipient.threadId) {
+          return;
+        }
+        try {
+          await appServer.resumeThread(recipient.threadId);
+        } catch (cause) {
+          const message = failureMessage(cause);
+          for (const failedMessage of queue.splice(0)) {
+            store.failDelivery(failedMessage, message);
+          }
+          return;
+        }
+        recipient.status = "idle";
+        store.updateAgentStatus(meshRunId, recipient);
+      }
+      if (recipient.status !== "idle") {
+        return;
+      }
+      const message = queue.shift();
+      if (message) {
+        const outcome = await deliverNotification(appServer, store, meshRunId, recipient, message);
+        if (outcome === "ambiguous") {
+          return;
+        }
+      }
+    }
+  } finally {
+    scheduler.delivering.delete(recipient.id);
+  }
+}
+
+function notification(
+  id: string,
+  conversationId: string,
+  senderAgentId: string,
+  recipientAgentId: string,
+  body: string,
+  context: NotificationContext | undefined,
+): Message {
+  return {
+    id,
+    kind: "notification",
+    senderAgentId,
+    recipientAgentId,
+    conversationId,
+    createdAt: new Date().toISOString(),
+    body,
+    ...context,
+  };
+}
+
+async function deliverNotification(
+  appServer: AppServerAdapter,
+  store: TranscriptStore,
+  meshRunId: string,
+  recipient: PublicAgent,
+  message: Message,
+): Promise<"idle" | "ambiguous"> {
+  if (!recipient.threadId) {
+    return "ambiguous";
+  }
+  store.markDeliveryInjecting(message);
+  recipient.status = "working";
+  store.updateAgentStatus(meshRunId, recipient);
+  let handling: Awaited<ReturnType<AppServerAdapter["startHandling"]>>;
+  try {
+    handling = await appServer.startHandling({
+      threadId: recipient.threadId,
+      message,
+    });
+  } catch (cause) {
+    store.failDelivery(message, failureMessage(cause));
+    return "ambiguous";
+  }
+  store.markHandlingActive(message, handling.turnId);
+  try {
+    const completion = await handling.completed;
+    store.completeNotificationHandling(message, handling.turnId, completion.finalOutput);
+  } catch (cause) {
+    store.failHandling(message, handling.turnId, failureMessage(cause));
+  }
+  recipient.status = "idle";
+  store.updateAgentStatus(meshRunId, recipient);
+  return "idle";
+}
+
+function validateNotificationInput(input: {
+  recipientAgentId: string;
+  body: string;
+  context?: NotificationContext;
+}): { recipientAgentId: string; body: string; context?: NotificationContext } {
+  if (typeof input.recipientAgentId !== "string" || input.recipientAgentId === "") {
+    throw new Error("Notification recipient Agent ID is required.");
+  }
+  if (typeof input.body !== "string" || Buffer.byteLength(input.body, "utf8") > 32 * 1024) {
+    throw new Error("Notification body must be a UTF-8 string of at most 32 KiB.");
+  }
+  if (input.context === undefined) {
+    return { recipientAgentId: input.recipientAgentId, body: input.body };
+  }
+  const { subject, fileReferences, gitCommitId, worktreeFingerprint } = input.context;
+  if (subject !== undefined && (typeof subject !== "string" || [...subject].length > 200)) {
+    throw new Error("Notification subject must contain at most 200 characters.");
+  }
+  if (
+    fileReferences !== undefined &&
+    (!Array.isArray(fileReferences) ||
+      fileReferences.length > 32 ||
+      fileReferences.some((reference) => typeof reference !== "string"))
+  ) {
+    throw new Error("Notification may contain at most 32 file references.");
+  }
+  const normalizedReferences = fileReferences?.map(normalizedRepositoryPath);
+  if (gitCommitId !== undefined && typeof gitCommitId !== "string") {
+    throw new Error("Notification Git commit ID must be a string.");
+  }
+  if (worktreeFingerprint !== undefined && typeof worktreeFingerprint !== "string") {
+    throw new Error("Notification worktree fingerprint must be a string.");
+  }
+  return {
+    recipientAgentId: input.recipientAgentId,
+    body: input.body,
+    context: {
+      ...(subject === undefined ? {} : { subject }),
+      ...(normalizedReferences === undefined ? {} : { fileReferences: normalizedReferences }),
+      ...(gitCommitId === undefined ? {} : { gitCommitId }),
+      ...(worktreeFingerprint === undefined ? {} : { worktreeFingerprint }),
+    },
+  };
+}
+
+function normalizedRepositoryPath(reference: string): string {
+  const normalizedReference = normalize(reference);
+  if (
+    reference === "" ||
+    isAbsolute(reference) ||
+    normalizedReference === ".." ||
+    normalizedReference.startsWith("../") ||
+    normalizedReference.startsWith("..\\")
+  ) {
+    throw new Error("Notification file references must stay within the Repository.");
+  }
+  return normalizedReference;
+}
+
+function failureMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : "Unknown Notification delivery failure.";
 }

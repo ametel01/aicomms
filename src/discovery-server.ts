@@ -11,10 +11,26 @@ interface AgentAuthentication {
   credential: string;
 }
 
+export interface SendNotificationInput {
+  recipientAgentId: string;
+  body: string;
+  context?: {
+    subject?: string;
+    fileReferences?: string[];
+    gitCommitId?: string;
+    worktreeFingerprint?: string;
+  };
+}
+
+export interface DiscoveryOperations {
+  sendNotification(callerAgentId: string, input: SendNotificationInput): Promise<string>;
+}
+
 type DiscoveryRequest =
   | { id: number; operation: "authenticate"; agentId: string; credential: string }
   | { id: number; operation: "list" }
-  | { id: number; operation: "inspect"; agentId: string };
+  | { id: number; operation: "inspect"; agentId: string }
+  | { id: number; operation: "send"; input: SendNotificationInput };
 
 interface DiscoveryResponse {
   id: number;
@@ -31,12 +47,14 @@ export class DiscoveryServer {
     private readonly server: Server,
     private readonly authentications: Map<string, string>,
     private readonly agents: PublicAgent[],
+    private readonly operations: DiscoveryOperations,
   ) {}
 
   static async start(
     repositoryRoot: string,
     authentications: AgentAuthentication[],
     agents: PublicAgent[],
+    operations: DiscoveryOperations,
   ): Promise<DiscoveryServer> {
     const socketPath = join(repositoryRoot, ".codex-meshd", "supervisor.sock");
     await rm(socketPath, { force: true });
@@ -45,7 +63,7 @@ export class DiscoveryServer {
     );
     let discovery: DiscoveryServer | undefined;
     const server = createServer((socket) => discovery?.accept(socket));
-    discovery = new DiscoveryServer(socketPath, server, authenticationMap, agents);
+    discovery = new DiscoveryServer(socketPath, server, authenticationMap, agents, operations);
     try {
       await new Promise<void>((resolve, reject) => {
         server.once("error", reject);
@@ -112,20 +130,23 @@ export class DiscoveryServer {
           socket.destroy();
           return;
         }
-        const response = this.handle(request, callerAgentId);
-        if (request.operation === "authenticate" && response.ok) {
-          callerAgentId = request.agentId;
-        }
-        socket.write(`${JSON.stringify(response)}\n`);
-        if (request.operation === "authenticate" && !response.ok) {
-          socket.end();
-          return;
-        }
+        void this.handle(request, callerAgentId).then((response) => {
+          if (request.operation === "authenticate" && response.ok) {
+            callerAgentId = request.agentId;
+          }
+          socket.write(`${JSON.stringify(response)}\n`);
+          if (request.operation === "authenticate" && !response.ok) {
+            socket.end();
+          }
+        });
       }
     });
   }
 
-  private handle(request: DiscoveryRequest, callerAgentId: string | undefined): DiscoveryResponse {
+  private async handle(
+    request: DiscoveryRequest,
+    callerAgentId: string | undefined,
+  ): Promise<DiscoveryResponse> {
     if (request.operation === "authenticate") {
       if (callerAgentId) {
         return { id: request.id, ok: false, error: "Connection is already authenticated." };
@@ -140,6 +161,18 @@ export class DiscoveryServer {
     }
     if (request.operation === "list") {
       return { id: request.id, ok: true, result: this.agents.map(publicRegistration) };
+    }
+    if (request.operation === "send") {
+      try {
+        const messageId = await this.operations.sendNotification(callerAgentId, request.input);
+        return { id: request.id, ok: true, result: { message_id: messageId } };
+      } catch (cause) {
+        return {
+          id: request.id,
+          ok: false,
+          error: cause instanceof Error ? cause.message : "Notification was rejected.",
+        };
+      }
     }
     const agent = this.agents.find((candidate) => candidate.id === request.agentId);
     return agent

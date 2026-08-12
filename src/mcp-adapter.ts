@@ -53,7 +53,7 @@ class SupervisorSocketClient {
   }
 
   async call(
-    operation: "list" | "inspect",
+    operation: "list" | "inspect" | "send",
     arguments_?: Record<string, unknown>,
   ): Promise<SocketResponse>;
   async call(
@@ -160,6 +160,16 @@ async function handleJsonRpc(
     typeof params.arguments.agent_id === "string"
   ) {
     response = await supervisor.call("inspect", { agentId: params.arguments.agent_id });
+  } else if (params.name === "agents.send" && validSendArguments(params.arguments)) {
+    response = await supervisor.call("send", {
+      input: {
+        recipientAgentId: params.arguments.agent_id,
+        body: params.arguments.body,
+        ...(params.arguments.context === undefined
+          ? {}
+          : { context: normalizeContext(params.arguments.context) }),
+      },
+    });
   } else {
     respondError(request.id, -32602, "Invalid tool arguments.");
     return;
@@ -191,6 +201,29 @@ function toolDefinitions(): unknown[] {
         additionalProperties: false,
       },
     },
+    {
+      name: "agents.send",
+      description: "Send a Notification to another Agent without waiting for Handling.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent_id: { type: "string" },
+          body: { type: "string" },
+          context: {
+            type: "object",
+            properties: {
+              subject: { type: "string" },
+              file_references: { type: "array", items: { type: "string" } },
+              git_commit_id: { type: "string" },
+              worktree_fingerprint: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+        required: ["agent_id", "body"],
+        additionalProperties: false,
+      },
+    },
   ];
 }
 
@@ -212,6 +245,47 @@ function requiredEnvironment(environment: NodeJS.ProcessEnv, name: string): stri
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validSendArguments(arguments_: Record<string, unknown>): boolean {
+  return (
+    Object.keys(arguments_).every((key) => ["agent_id", "body", "context"].includes(key)) &&
+    typeof arguments_.agent_id === "string" &&
+    typeof arguments_.body === "string" &&
+    (arguments_.context === undefined || validContext(arguments_.context))
+  );
+}
+
+function validContext(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    Object.keys(value).every((key) =>
+      ["subject", "file_references", "git_commit_id", "worktree_fingerprint"].includes(key),
+    ) &&
+    (value.subject === undefined || typeof value.subject === "string") &&
+    (value.file_references === undefined ||
+      (Array.isArray(value.file_references) &&
+        value.file_references.every((reference) => typeof reference === "string"))) &&
+    (value.git_commit_id === undefined || typeof value.git_commit_id === "string") &&
+    (value.worktree_fingerprint === undefined || typeof value.worktree_fingerprint === "string")
+  );
+}
+
+function normalizeContext(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  return {
+    ...(typeof value.subject === "string" ? { subject: value.subject } : {}),
+    ...(Array.isArray(value.file_references) &&
+    value.file_references.every((reference) => typeof reference === "string")
+      ? { fileReferences: value.file_references }
+      : {}),
+    ...(typeof value.git_commit_id === "string" ? { gitCommitId: value.git_commit_id } : {}),
+    ...(typeof value.worktree_fingerprint === "string"
+      ? { worktreeFingerprint: value.worktree_fingerprint }
+      : {}),
+  };
 }
 
 if (import.meta.main) {

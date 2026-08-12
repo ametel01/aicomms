@@ -1,5 +1,8 @@
 import type {
   AppServerAdapter,
+  HandlingCompletion,
+  HandlingHandle,
+  StartHandlingRequest,
   StartObjectiveRequest,
   StartThreadRequest,
   ThreadHandle,
@@ -13,6 +16,9 @@ export type ScriptedFailure =
   | "adviser-thread"
   | "mcp"
   | "writer-objective"
+  | "handling-start"
+  | "handling-completion"
+  | "resume-thread"
   | "close";
 
 export class ScriptedAppServer implements AppServerAdapter {
@@ -20,10 +26,13 @@ export class ScriptedAppServer implements AppServerAdapter {
     | { operation: "initialize" }
     | { operation: "start-thread"; request: StartThreadRequest }
     | { operation: "start-objective"; request: StartObjectiveRequest }
+    | { operation: "start-handling"; request: StartHandlingRequest }
+    | { operation: "resume-thread"; threadId: string }
     | { operation: "close" }
   > = [];
   statusSubscriptionCount = 0;
   readonly #statusListeners = new Set<ThreadStatusListener>();
+  #handlingCompletion: ReturnType<typeof Promise.withResolvers<HandlingCompletion>> | undefined;
 
   constructor(private readonly failure?: ScriptedFailure) {}
 
@@ -35,6 +44,20 @@ export class ScriptedAppServer implements AppServerAdapter {
     for (const listener of this.#statusListeners) {
       listener(threadId, status);
     }
+  }
+
+  holdHandlings(): void {
+    this.#handlingCompletion = Promise.withResolvers<HandlingCompletion>();
+  }
+
+  completeHandling(finalOutput?: string): void {
+    this.#handlingCompletion?.resolve(finalOutput === undefined ? {} : { finalOutput });
+  }
+
+  handlingRequests(): StartHandlingRequest[] {
+    return this.calls.flatMap((call) =>
+      call.operation === "start-handling" ? [call.request] : [],
+    );
   }
 
   async initialize(): Promise<void> {
@@ -61,6 +84,27 @@ export class ScriptedAppServer implements AppServerAdapter {
       throw new Error("scripted Writer Objective failure");
     }
     return { turnId: "turn-writer-objective" };
+  }
+
+  async startHandling(request: StartHandlingRequest): Promise<HandlingHandle> {
+    this.calls.push({ operation: "start-handling", request });
+    if (this.failure === "handling-start") {
+      throw new Error("scripted Handling acceptance failure");
+    }
+    return {
+      turnId: "turn-handling-1",
+      completed:
+        this.failure === "handling-completion"
+          ? Promise.reject(new Error("scripted Handling completion failure"))
+          : (this.#handlingCompletion?.promise ?? Promise.resolve({ finalOutput: "Handled." })),
+    };
+  }
+
+  async resumeThread(threadId: string): Promise<void> {
+    this.calls.push({ operation: "resume-thread", threadId });
+    if (this.failure === "resume-thread") {
+      throw new Error("scripted thread resume failure");
+    }
   }
 
   onThreadStatusChanged(listener: ThreadStatusListener): () => void {

@@ -23,7 +23,7 @@ export interface MeshConfiguration {
   agents: [AgentConfiguration, AgentConfiguration];
 }
 
-export type AgentLifecycleStatus = "starting" | "working" | "idle" | "stopped";
+export type AgentLifecycleStatus = "starting" | "working" | "idle" | "unloaded" | "stopped";
 
 export interface PublicAgent {
   id: string;
