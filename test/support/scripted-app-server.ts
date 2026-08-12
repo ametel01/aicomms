@@ -2,6 +2,9 @@ import type {
   AppServerAdapter,
   HandlingCompletion,
   HandlingHandle,
+  OperatorWaitListener,
+  OperatorWaitRequest,
+  OperatorWaitResponse,
   StartHandlingRequest,
   StartNoticeRequest,
   StartObjectiveRequest,
@@ -34,12 +37,19 @@ export class ScriptedAppServer implements AppServerAdapter {
     | { operation: "start-handling"; request: StartHandlingRequest }
     | { operation: "start-notice"; request: StartNoticeRequest }
     | { operation: "resume-thread"; threadId: string }
+    | { operation: "respond-operator-wait"; requestId: string; response: OperatorWaitResponse }
+    | { operation: "interrupt-turn"; threadId: string; turnId: string }
     | { operation: "close" }
   > = [];
   statusSubscriptionCount = 0;
   readonly #statusListeners = new Set<ThreadStatusListener>();
+  readonly #operatorWaitListeners = new Set<OperatorWaitListener>();
   #handlingCompletion: ReturnType<typeof Promise.withResolvers<HandlingCompletion>> | undefined;
   #nextHandlingFailure: ScriptedFailure | undefined;
+  #waitOnNextHandlingStart: OperatorWaitRequest | undefined;
+  #operatorResponseObserver: (() => Promise<void>) | undefined;
+  #nextOperatorResponseFailure: string | undefined;
+  #handlingStartGate: ReturnType<typeof Promise.withResolvers<void>> | undefined;
 
   constructor(private readonly failure?: ScriptedFailure) {}
 
@@ -53,8 +63,35 @@ export class ScriptedAppServer implements AppServerAdapter {
     }
   }
 
+  emitOperatorWait(request: OperatorWaitRequest): void {
+    for (const listener of this.#operatorWaitListeners) {
+      listener(request);
+    }
+  }
+
+  waitOnNextHandlingStart(request: OperatorWaitRequest): void {
+    this.#waitOnNextHandlingStart = request;
+  }
+
+  observeOperatorResponse(observer: () => Promise<void>): void {
+    this.#operatorResponseObserver = observer;
+  }
+
+  failNextOperatorResponse(message: string): void {
+    this.#nextOperatorResponseFailure = message;
+  }
+
   holdHandlings(): void {
     this.#handlingCompletion = Promise.withResolvers<HandlingCompletion>();
+  }
+
+  holdHandlingStarts(): void {
+    this.#handlingStartGate = Promise.withResolvers<void>();
+  }
+
+  releaseHandlingStart(): void {
+    this.#handlingStartGate?.resolve();
+    this.#handlingStartGate = undefined;
   }
 
   completeHandling(finalOutput?: string): void {
@@ -105,6 +142,11 @@ export class ScriptedAppServer implements AppServerAdapter {
     this.calls.push({ operation: "start-handling", request });
     const failure = this.#nextHandlingFailure ?? this.failure;
     this.#nextHandlingFailure = undefined;
+    if (this.#waitOnNextHandlingStart) {
+      this.emitOperatorWait(this.#waitOnNextHandlingStart);
+      this.#waitOnNextHandlingStart = undefined;
+    }
+    await this.#handlingStartGate?.promise;
     if (failure === "handling-start") {
       throw new HandlingStartError("scripted ambiguous acceptance", "uncertain");
     }
@@ -138,10 +180,32 @@ export class ScriptedAppServer implements AppServerAdapter {
     }
   }
 
+  async respondToOperatorWait(requestId: string, response: OperatorWaitResponse): Promise<void> {
+    this.calls.push({ operation: "respond-operator-wait", requestId, response });
+    await this.#operatorResponseObserver?.();
+    if (this.#nextOperatorResponseFailure) {
+      const failure = this.#nextOperatorResponseFailure;
+      this.#nextOperatorResponseFailure = undefined;
+      throw new Error(failure);
+    }
+  }
+
+  async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    this.calls.push({ operation: "interrupt-turn", threadId, turnId });
+    const completion = this.#handlingCompletion;
+    this.#handlingCompletion = undefined;
+    completion?.reject(new Error("scripted Handling interruption"));
+  }
+
   onThreadStatusChanged(listener: ThreadStatusListener): () => void {
     this.statusSubscriptionCount += 1;
     this.#statusListeners.add(listener);
     return () => this.#statusListeners.delete(listener);
+  }
+
+  onOperatorWait(listener: OperatorWaitListener): () => void {
+    this.#operatorWaitListeners.add(listener);
+    return () => this.#operatorWaitListeners.delete(listener);
   }
 
   async close(): Promise<void> {

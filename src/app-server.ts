@@ -47,6 +47,20 @@ export interface HandlingHandle {
   completed: Promise<HandlingCompletion>;
 }
 
+export interface OperatorWaitRequest {
+  id: string;
+  type: "approval" | "input";
+  threadId: string;
+  turnId: string;
+  prompt: string;
+}
+
+export type OperatorWaitResponse =
+  | { type: "approval"; decision: "approved" | "denied" }
+  | { type: "input"; answer: string };
+
+export type OperatorWaitListener = (request: OperatorWaitRequest) => void;
+
 export class HandlingStartError extends Error {
   constructor(
     message: string,
@@ -64,7 +78,10 @@ export interface AppServerAdapter {
   startHandling(request: StartHandlingRequest): Promise<HandlingHandle>;
   startNotice(request: StartNoticeRequest): Promise<HandlingHandle>;
   resumeThread(threadId: string): Promise<void>;
+  respondToOperatorWait(requestId: string, response: OperatorWaitResponse): Promise<void>;
+  interruptTurn(threadId: string, turnId: string): Promise<void>;
   onThreadStatusChanged(listener: ThreadStatusListener): () => void;
+  onOperatorWait(listener: OperatorWaitListener): () => void;
   close(): Promise<void>;
 }
 
@@ -91,7 +108,16 @@ export function unavailableAppServerAdapter(): AppServerAdapter {
     async resumeThread(): Promise<void> {
       throw new Error("The real Codex app-server Adapter is not available yet.");
     },
+    async respondToOperatorWait(): Promise<void> {
+      throw new Error("The real Codex app-server Adapter is not available yet.");
+    },
+    async interruptTurn(): Promise<void> {
+      throw new Error("The real Codex app-server Adapter is not available yet.");
+    },
     onThreadStatusChanged(): () => void {
+      return () => {};
+    },
+    onOperatorWait(): () => void {
       return () => {};
     },
     async close(): Promise<void> {},

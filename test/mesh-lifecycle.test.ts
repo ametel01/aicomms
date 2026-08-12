@@ -80,6 +80,7 @@ describe("Mesh Run lifecycle", () => {
           },
         ],
       },
+      operatorCredential: expect.any(String),
     });
     expect(appServer.calls).toEqual([
       { operation: "initialize" },

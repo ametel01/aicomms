@@ -9,8 +9,9 @@
 > correlated Reply turn, with deferred failures delivered as Supervisor Notices. Message input,
 > Repository paths, authenticated identity, and fixed role authority are enforced at the Agent
 > boundary. Causal Conversations enforce duplicate, Message-count, and five-minute deadline
-> controls without reopening terminal work. The Operator CLI does not yet connect to a real Codex
-> app-server.
+> controls without reopening terminal work. Operator Requests pause those deadlines until an
+> explicit response, and selected Conversations can be cancelled without stopping unrelated work.
+> The Operator CLI does not yet connect to a real Codex app-server.
 
 ## Confirmed v0
 
@@ -24,6 +25,19 @@ The first prototype is deliberately narrow:
 - No remote peers, arbitrary-session attachment, multiple writers, or crash recovery.
 
 The target proof is a fully automatic Writer → Adviser → Writer exchange that produces and verifies a bounded Repository change without Agent polling, human message delivery, or Adviser writes.
+
+## Operator controls
+
+The Operator-facing CLI surface includes:
+
+The `start` result includes a per-run Operator credential. Supply it through
+`CODEX_MESHD_OPERATOR_CREDENTIAL` (or `--operator-credential`) for control commands; Agent MCP
+adapters receive distinct credentials and cannot use Operator operations.
+
+- `codex-meshd requests --cwd <repository> [--mesh-run <id>]` to list durable approval and input requests.
+- `codex-meshd respond --cwd <repository> --mesh-run <id> --request <id> --decision approved|denied` for approvals.
+- `codex-meshd respond --cwd <repository> --mesh-run <id> --request <id> --answer <text>` for requested input.
+- `codex-meshd cancel --cwd <repository> --mesh-run <id> --conversation <id>` to cancel one Conversation. Cancellation cannot undo completed filesystem or external effects.
 
 ## Documentation
 

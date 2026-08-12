@@ -3,8 +3,9 @@ import { chmod, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { McpServerLaunch } from "./app-server.ts";
+import type { McpServerLaunch, OperatorWaitResponse } from "./app-server.ts";
 import type { PublicAgent } from "./startup-validation.ts";
+import type { OperatorRequest } from "./transcript-store.ts";
 
 interface AgentAuthentication {
   agentId: string;
@@ -25,6 +26,21 @@ export interface SendNotificationInput {
 export interface DiscoveryOperations {
   sendNotification(callerAgentId: string, input: SendNotificationInput): Promise<string>;
   askQuestion(callerAgentId: string, input: SendNotificationInput): Promise<string>;
+  listOperatorRequests(meshRunId?: string): OperatorRequest[];
+  respondToOperatorRequest(
+    meshRunId: string,
+    requestId: string,
+    response: OperatorWaitResponse,
+  ): Promise<OperatorRequest>;
+  cancelConversation(
+    meshRunId: string,
+    conversationId: string,
+  ): Promise<{
+    status: "cancelled";
+    conversationId: string;
+    effectsReversible: false;
+    warning: string;
+  }>;
 }
 
 type DiscoveryRequest =
@@ -32,7 +48,28 @@ type DiscoveryRequest =
   | { id: number; operation: "list" }
   | { id: number; operation: "inspect"; agentId: string }
   | { id: number; operation: "send"; input: SendNotificationInput }
-  | { id: number; operation: "ask"; input: SendNotificationInput };
+  | { id: number; operation: "ask"; input: SendNotificationInput }
+  | {
+      id: number;
+      operation: "operator-requests";
+      operatorCredential: string;
+      meshRunId?: string;
+    }
+  | {
+      id: number;
+      operation: "operator-respond";
+      operatorCredential: string;
+      meshRunId: string;
+      requestId: string;
+      response: OperatorWaitResponse;
+    }
+  | {
+      id: number;
+      operation: "operator-cancel";
+      operatorCredential: string;
+      meshRunId: string;
+      conversationId: string;
+    };
 
 interface DiscoveryResponse {
   id: number;
@@ -48,6 +85,7 @@ export class DiscoveryServer {
     readonly socketPath: string,
     private readonly server: Server,
     private readonly authentications: Map<string, string>,
+    private readonly operatorCredential: string,
     private readonly agents: PublicAgent[],
     private readonly operations: DiscoveryOperations,
   ) {}
@@ -55,6 +93,7 @@ export class DiscoveryServer {
   static async start(
     repositoryRoot: string,
     authentications: AgentAuthentication[],
+    operatorCredential: string,
     agents: PublicAgent[],
     operations: DiscoveryOperations,
   ): Promise<DiscoveryServer> {
@@ -65,7 +104,14 @@ export class DiscoveryServer {
     );
     let discovery: DiscoveryServer | undefined;
     const server = createServer((socket) => discovery?.accept(socket));
-    discovery = new DiscoveryServer(socketPath, server, authenticationMap, agents, operations);
+    discovery = new DiscoveryServer(
+      socketPath,
+      server,
+      authenticationMap,
+      operatorCredential,
+      agents,
+      operations,
+    );
     try {
       await new Promise<void>((resolve, reject) => {
         server.once("error", reject);
@@ -158,6 +204,34 @@ export class DiscoveryServer {
         ? { id: request.id, ok: true, result: { agentId: request.agentId } }
         : { id: request.id, ok: false, error: "Agent authentication failed." };
     }
+    if (
+      request.operation === "operator-requests" ||
+      request.operation === "operator-respond" ||
+      request.operation === "operator-cancel"
+    ) {
+      if (!equalSecret(this.operatorCredential, request.operatorCredential)) {
+        return { id: request.id, ok: false, error: "Operator authentication failed." };
+      }
+      try {
+        const result =
+          request.operation === "operator-requests"
+            ? this.operations.listOperatorRequests(request.meshRunId)
+            : request.operation === "operator-respond"
+              ? await this.operations.respondToOperatorRequest(
+                  request.meshRunId,
+                  request.requestId,
+                  request.response,
+                )
+              : await this.operations.cancelConversation(request.meshRunId, request.conversationId);
+        return { id: request.id, ok: true, result };
+      } catch (cause) {
+        return {
+          id: request.id,
+          ok: false,
+          error: cause instanceof Error ? cause.message : "Operator request failed.",
+        };
+      }
+    }
     if (!callerAgentId) {
       return { id: request.id, ok: false, error: "Agent authentication is required." };
     }
@@ -185,7 +259,10 @@ export class DiscoveryServer {
   }
 }
 
-function equalSecret(expected: string, supplied: string): boolean {
+function equalSecret(expected: string, supplied: unknown): boolean {
+  if (typeof supplied !== "string") {
+    return false;
+  }
   const expectedBytes = Buffer.from(expected);
   const suppliedBytes = Buffer.from(supplied);
   return (

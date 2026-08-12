@@ -64,14 +64,18 @@ export interface TranscriptEvent {
     | "handling.active"
     | "handling.completed"
     | "handling.failed"
+    | "handling.interrupted"
     | "conversation.completed"
     | "conversation.failed"
+    | "conversation.cancelled"
     | "conversation.expired"
     | "conversation.limit_reached"
     | "delivery.rejected"
     | "delivery.cancelled"
     | "delivery.expired"
-    | "delivery.ambiguous";
+    | "delivery.ambiguous"
+    | "operator_wait.requested"
+    | "operator_wait.resolved";
   createdAt: string;
 }
 
@@ -94,6 +98,21 @@ export interface SupervisorNotice {
   conversationId: string;
   reason: string;
   createdAt: string;
+}
+
+export interface OperatorRequest {
+  id: string;
+  meshRunId: string;
+  type: "approval" | "input";
+  threadId: string;
+  turnId: string;
+  prompt: string;
+  status: "pending" | "responding" | "resolved" | "delivery_failed" | "cancelled";
+  createdAt: string;
+  conversationId?: string;
+  response?: unknown;
+  failureMessage?: string;
+  resolvedAt?: string;
 }
 
 export interface ConversationLimits {
@@ -155,6 +174,21 @@ interface NoticeRow {
   conversation_id: string;
   reason: string;
   created_at: string;
+}
+
+interface OperatorRequestRow {
+  id: string;
+  mesh_run_id: string;
+  type: OperatorRequest["type"];
+  thread_id: string;
+  turn_id: string;
+  conversation_id: string | null;
+  prompt: string;
+  status: OperatorRequest["status"];
+  response: string | null;
+  failure_message: string | null;
+  created_at: string;
+  resolved_at: string | null;
 }
 
 export class TranscriptStore {
@@ -238,9 +272,24 @@ export class TranscriptStore {
         reason TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS operator_requests (
+        id TEXT PRIMARY KEY,
+        mesh_run_id TEXT NOT NULL REFERENCES mesh_runs(id),
+        type TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        conversation_id TEXT REFERENCES conversations(id),
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        response TEXT,
+        failure_message TEXT,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
     `);
     ensureColumn(database, "deliveries", "failure_message", "TEXT");
     ensureColumn(database, "handlings", "failure_message", "TEXT");
+    ensureColumn(database, "operator_requests", "failure_message", "TEXT");
     ensureMessageColumn(database);
     database.exec(
       `CREATE UNIQUE INDEX IF NOT EXISTS one_reply_per_question
@@ -316,6 +365,122 @@ export class TranscriptStore {
     this.database
       .query("UPDATE agents SET status = ? WHERE id = ? AND mesh_run_id = ?")
       .run(agent.status, agent.id, meshRunId);
+  }
+
+  recordOperatorRequest(request: OperatorRequest): void {
+    const record = this.database.transaction(() => {
+      this.database
+        .query(
+          `INSERT INTO operator_requests
+            (id, mesh_run_id, type, thread_id, turn_id, conversation_id, prompt, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+        )
+        .run(
+          request.id,
+          request.meshRunId,
+          request.type,
+          request.threadId,
+          request.turnId,
+          request.conversationId ?? null,
+          request.prompt,
+          request.createdAt,
+        );
+      if (request.conversationId) {
+        this.recordEvent(request.conversationId, "operator_wait.requested");
+      }
+    });
+    record();
+  }
+
+  listOperatorRequests(meshRunId?: string): OperatorRequest[] {
+    const rows = (
+      meshRunId
+        ? this.database
+            .query("SELECT * FROM operator_requests WHERE mesh_run_id = ? ORDER BY rowid")
+            .all(meshRunId)
+        : this.database.query("SELECT * FROM operator_requests ORDER BY rowid").all()
+    ) as OperatorRequestRow[];
+    return rows.map(operatorRequestFromRow);
+  }
+
+  beginOperatorRequestResponse(requestId: string, response: unknown): OperatorRequest | undefined {
+    const begin = this.database.transaction(() => {
+      const current = this.database
+        .query("SELECT * FROM operator_requests WHERE id = ?")
+        .get(requestId) as OperatorRequestRow | null;
+      if (current?.status !== "pending" && current?.status !== "delivery_failed") {
+        return undefined;
+      }
+      this.database
+        .query(
+          `UPDATE operator_requests
+           SET status = 'responding', response = ?, failure_message = NULL, resolved_at = NULL
+           WHERE id = ? AND status IN ('pending', 'delivery_failed')`,
+        )
+        .run(JSON.stringify(response), requestId);
+      return operatorRequestFromRow({
+        ...current,
+        status: "responding",
+        response: JSON.stringify(response),
+        failure_message: null,
+        resolved_at: null,
+      });
+    });
+    return begin();
+  }
+
+  completeOperatorRequestResponse(requestId: string): OperatorRequest | undefined {
+    const resolvedAt = new Date().toISOString();
+    const complete = this.database.transaction(() => {
+      const current = this.database
+        .query("SELECT * FROM operator_requests WHERE id = ?")
+        .get(requestId) as OperatorRequestRow | null;
+      if (current?.status !== "responding") {
+        return undefined;
+      }
+      this.database
+        .query(
+          `UPDATE operator_requests
+           SET status = 'resolved', failure_message = NULL, resolved_at = ?
+           WHERE id = ? AND status = 'responding'`,
+        )
+        .run(resolvedAt, requestId);
+      if (current.conversation_id) {
+        this.recordEvent(current.conversation_id, "operator_wait.resolved");
+      }
+      return operatorRequestFromRow({
+        ...current,
+        status: "resolved",
+        failure_message: null,
+        resolved_at: resolvedAt,
+      });
+    });
+    return complete();
+  }
+
+  failOperatorRequestResponse(
+    requestId: string,
+    failureMessage: string,
+  ): OperatorRequest | undefined {
+    const current = this.database
+      .query("SELECT * FROM operator_requests WHERE id = ?")
+      .get(requestId) as OperatorRequestRow | null;
+    if (current?.status !== "responding") {
+      return undefined;
+    }
+    this.database
+      .query(
+        `UPDATE operator_requests
+         SET status = 'delivery_failed', failure_message = ?, resolved_at = NULL
+         WHERE id = ? AND status = 'responding'`,
+      )
+      .run(failureMessage, requestId);
+    return operatorRequestFromRow({
+      ...current,
+      status: "delivery_failed",
+      failure_message: failureMessage,
+      resolved_at: null,
+    });
   }
 
   recordAgentMessage(
@@ -406,11 +571,16 @@ export class TranscriptStore {
   ): MessageAcceptance {
     let result: MessageAcceptance = { accepted: false, reason: "Reply acceptance failed." };
     const complete = this.database.transaction(() => {
-      this.database
+      const handlingResult = this.database
         .query(
-          "UPDATE handlings SET status = 'completed', final_output = ? WHERE message_id = ? AND codex_turn_id = ?",
+          `UPDATE handlings SET status = 'completed', final_output = ?
+           WHERE message_id = ? AND codex_turn_id = ? AND status = 'active'`,
         )
         .run(finalOutput, message.id, turnId);
+      if (handlingResult.changes !== 1) {
+        result = { accepted: false, reason: "Question Handling is no longer active." };
+        return;
+      }
       this.recordEvent(message.conversationId, "handling.completed");
       const conversation = this.conversationRow(message.conversationId);
       if (conversation?.status !== "open") {
@@ -528,6 +698,41 @@ export class TranscriptStore {
     return row?.status === "open";
   }
 
+  cancelConversation(meshRunId: string, conversationId: string): boolean {
+    let cancelled = false;
+    const cancel = this.database.transaction(() => {
+      const result = this.database
+        .query(
+          `UPDATE conversations SET status = 'cancelled'
+           WHERE id = ? AND mesh_run_id = ? AND status = 'open'`,
+        )
+        .run(conversationId, meshRunId);
+      if (result.changes !== 1) {
+        return;
+      }
+      cancelled = true;
+      const pending = this.pendingDeliveryIds(conversationId);
+      for (const messageId of pending) {
+        this.database
+          .query(
+            `UPDATE deliveries SET status = 'cancelled', failure_message = ? WHERE message_id = ?`,
+          )
+          .run("Conversation was cancelled by the Operator.", messageId);
+        this.recordEvent(conversationId, "delivery.cancelled");
+      }
+      this.database
+        .query(
+          `UPDATE operator_requests SET status = 'cancelled', resolved_at = ?
+           WHERE conversation_id = ?
+             AND status IN ('pending', 'responding', 'delivery_failed')`,
+        )
+        .run(new Date().toISOString(), conversationId);
+      this.recordEvent(conversationId, "conversation.cancelled");
+    });
+    cancel();
+    return cancelled;
+  }
+
   expireConversation(conversationId: string, now: number, limits: ConversationLimits): boolean {
     const conversation = this.conversationRow(conversationId);
     if (
@@ -557,11 +762,15 @@ export class TranscriptStore {
 
   completeHandling(message: Message, turnId: string, finalOutput?: string): void {
     const complete = this.database.transaction(() => {
-      this.database
+      const result = this.database
         .query(
-          "UPDATE handlings SET status = 'completed', final_output = ? WHERE message_id = ? AND codex_turn_id = ?",
+          `UPDATE handlings SET status = 'completed', final_output = ?
+           WHERE message_id = ? AND codex_turn_id = ? AND status = 'active'`,
         )
         .run(finalOutput ?? null, message.id, turnId);
+      if (result.changes !== 1) {
+        return;
+      }
       this.recordEvent(message.conversationId, "handling.completed");
       this.completeConversationIfReady(message.conversationId);
     });
@@ -610,15 +819,43 @@ export class TranscriptStore {
 
   failHandling(message: Message, turnId: string, failureMessage: string): void {
     const fail = this.database.transaction(() => {
-      this.database
+      const result = this.database
         .query(
-          "UPDATE handlings SET status = 'failed', failure_message = ? WHERE message_id = ? AND codex_turn_id = ?",
+          `UPDATE handlings SET status = 'failed', failure_message = ?
+           WHERE message_id = ? AND codex_turn_id = ? AND status = 'active'`,
         )
         .run(failureMessage, message.id, turnId);
+      if (result.changes !== 1) {
+        return;
+      }
       this.recordEvent(message.conversationId, "handling.failed");
       this.failConversationIfOpen(message.conversationId);
     });
     fail();
+  }
+
+  interruptHandling(message: Message, turnId: string): void {
+    const interrupt = this.database.transaction(() => {
+      const result = this.database
+        .query(
+          `UPDATE handlings SET status = 'interrupted', failure_message = ?
+           WHERE message_id = ? AND codex_turn_id = ? AND status = 'active'`,
+        )
+        .run("Conversation was cancelled by the Operator.", message.id, turnId);
+      if (result.changes === 1) {
+        this.recordEvent(message.conversationId, "handling.interrupted");
+      }
+    });
+    interrupt();
+  }
+
+  failInterruptedHandling(message: Message, turnId: string, failureMessage: string): void {
+    this.database
+      .query(
+        `UPDATE handlings SET failure_message = ?
+         WHERE message_id = ? AND codex_turn_id = ? AND status = 'interrupted'`,
+      )
+      .run(failureMessage, message.id, turnId);
   }
 
   inspectConversation(conversationId: string): ConversationSnapshot | undefined {
@@ -783,6 +1020,19 @@ export class TranscriptStore {
     }
   }
 
+  private pendingDeliveryIds(conversationId: string): string[] {
+    return (
+      this.database
+        .query(
+          `SELECT deliveries.message_id
+           FROM deliveries
+           JOIN messages ON messages.id = deliveries.message_id
+           WHERE messages.conversation_id = ? AND deliveries.status IN ('accepted', 'queued')`,
+        )
+        .all(conversationId) as Array<{ message_id: string }>
+    ).map(({ message_id: messageId }) => messageId);
+  }
+
   private terminateConversation(conversationId: string, status: "expired" | "limit_reached"): void {
     const result = this.database
       .query("UPDATE conversations SET status = ? WHERE id = ? AND status = 'open'")
@@ -790,17 +1040,10 @@ export class TranscriptStore {
     if (result.changes !== 1) {
       return;
     }
-    const pending = this.database
-      .query(
-        `SELECT deliveries.message_id
-         FROM deliveries
-         JOIN messages ON messages.id = deliveries.message_id
-         WHERE messages.conversation_id = ? AND deliveries.status IN ('accepted', 'queued')`,
-      )
-      .all(conversationId) as Array<{ message_id: string }>;
+    const pending = this.pendingDeliveryIds(conversationId);
     const deliveryStatus = status === "expired" ? "expired" : "cancelled";
     const deliveryEvent = status === "expired" ? "delivery.expired" : "delivery.cancelled";
-    for (const { message_id: messageId } of pending) {
+    for (const messageId of pending) {
       this.database
         .query("UPDATE deliveries SET status = ?, failure_message = ? WHERE message_id = ?")
         .run(
@@ -928,9 +1171,26 @@ function noticeFromRow(row: NoticeRow): SupervisorNotice {
   };
 }
 
+function operatorRequestFromRow(row: OperatorRequestRow): OperatorRequest {
+  return {
+    id: row.id,
+    meshRunId: row.mesh_run_id,
+    type: row.type,
+    threadId: row.thread_id,
+    turnId: row.turn_id,
+    prompt: row.prompt,
+    status: row.status,
+    createdAt: row.created_at,
+    ...(row.conversation_id ? { conversationId: row.conversation_id } : {}),
+    ...(row.response ? { response: JSON.parse(row.response) as unknown } : {}),
+    ...(row.failure_message ? { failureMessage: row.failure_message } : {}),
+    ...(row.resolved_at ? { resolvedAt: row.resolved_at } : {}),
+  };
+}
+
 function ensureColumn(
   database: Database,
-  table: "deliveries" | "handlings",
+  table: "deliveries" | "handlings" | "operator_requests",
   column: "failure_message",
   definition: "TEXT",
 ): void {
