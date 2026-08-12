@@ -1,358 +1,234 @@
-import { createHash } from "node:crypto";
-import { readFile, realpath } from "node:fs/promises";
-import { resolve } from "node:path";
+import { randomBytes, randomUUID } from "node:crypto";
+import {
+  type AppServerAdapter,
+  sandboxForRole,
+  unavailableAppServerAdapter,
+} from "./app-server.ts";
+import {
+  type AgentConfiguration,
+  type AgentLifecycleStatus,
+  type AgentModelOptions,
+  type AgentRole,
+  type MeshConfiguration,
+  type PublicAgent,
+  type RepositoryIdentity,
+  resolveRepositoryIdentity,
+  type SupervisorError,
+  type SupervisorErrorCode,
+  validateStartup,
+} from "./startup-validation.ts";
+import { type MeshRun, TranscriptStore } from "./transcript-store.ts";
 
-export type AgentRole = "writer" | "adviser";
-
-export interface AgentModelOptions {
-  name: string;
-  reasoningEffort?: string;
-}
-
-export interface AgentConfiguration {
-  name: string;
-  role: AgentRole;
-  objective: string;
-  model: AgentModelOptions;
-  trustedInstructions: string;
-  capabilities: string[];
-}
-
-export interface MeshConfiguration {
-  version: 1;
-  agents: [AgentConfiguration, AgentConfiguration];
-}
+export type {
+  AgentConfiguration,
+  AgentLifecycleStatus,
+  AgentModelOptions,
+  AgentRole,
+  MeshConfiguration,
+  PublicAgent,
+  RepositoryIdentity,
+  SupervisorError,
+  SupervisorErrorCode,
+};
 
 export interface StartMeshRequest {
   cwd: string;
   configurationPath: string;
 }
 
-export type StartupValidationCode =
-  | "cli.command_invalid"
-  | "cli.config_required"
-  | "configuration.adviser.exactly_one"
-  | "configuration.agent.capabilities_required"
-  | "configuration.agent.capability_invalid"
-  | "configuration.agent.capability_required"
-  | "configuration.agent.instructions_required"
-  | "configuration.agent.invalid"
-  | "configuration.agent.model_name_required"
-  | "configuration.agent.model_required"
-  | "configuration.agent.name_duplicate"
-  | "configuration.agent.name_required"
-  | "configuration.agent.objective_required"
-  | "configuration.agent.reasoning_effort_invalid"
-  | "configuration.agent.role_invalid"
-  | "configuration.agents.exactly_two"
-  | "configuration.agents_required"
-  | "configuration.file_invalid"
-  | "configuration.invalid"
-  | "configuration.not_tracked"
-  | "configuration.version_unsupported"
-  | "configuration.writer.exactly_one"
-  | "repository.not_git";
-
-export interface StartupValidationError {
-  code: StartupValidationCode;
-  message: string;
-  path?: string;
-}
-
-export interface RepositoryIdentity {
-  id: string;
-  commonDirectory: string;
-}
-
 export type StartMeshResult =
-  | {
-      status: "rejected";
-      errors: StartupValidationError[];
-    }
-  | {
-      status: "validated";
-      repository: RepositoryIdentity;
-      configuration: MeshConfiguration;
-    };
+  | { status: "rejected"; errors: SupervisorError[] }
+  | { status: "failed"; meshRunId: string; error: SupervisorError }
+  | { status: "running"; meshRun: MeshRun };
+
+export interface StopMeshResult {
+  status: "stopped";
+  meshRunId: string;
+}
 
 export interface Supervisor {
   start(request: StartMeshRequest): Promise<StartMeshResult>;
+  stop(request: { meshRunId: string }): Promise<StopMeshResult>;
+  inspectMeshRun(request: { cwd: string; meshRunId: string }): Promise<MeshRun | undefined>;
 }
 
-export function createSupervisor(): Supervisor {
+export interface SupervisorOptions {
+  appServer?: AppServerAdapter;
+  generateOpaqueValue?: () => string;
+}
+
+interface ActiveMeshRun {
+  id: string;
+  appServer: AppServerAdapter;
+  store: TranscriptStore;
+}
+
+export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
+  const appServer = options.appServer ?? unavailableAppServerAdapter();
+  const generateOpaqueValue = options.generateOpaqueValue ?? defaultOpaqueValueGenerator();
+  let active: ActiveMeshRun | undefined;
+
   return {
     async start(request): Promise<StartMeshResult> {
-      const repository = await resolveRepositoryIdentity(request.cwd);
-      if (!repository) {
+      if (active) {
         return {
           status: "rejected",
           errors: [
             {
-              code: "repository.not_git",
-              message: "Startup requires a Git Repository.",
+              code: "startup.already_running",
+              message: "This Supervisor already owns an active Mesh Run.",
             },
           ],
         };
       }
 
-      const configurationResult = await loadMeshConfiguration(
-        request.cwd,
-        request.configurationPath,
-      );
-      if (!configurationResult.ok) {
-        return { status: "rejected", errors: configurationResult.errors };
+      const validation = await validateStartup(request.cwd, request.configurationPath);
+      if (!validation.ok) {
+        return { status: "rejected", errors: validation.errors };
       }
 
-      return {
-        status: "validated",
-        repository,
-        configuration: configurationResult.configuration,
-      };
+      const meshRunId = generateOpaqueValue();
+      const agentRuntime = validation.configuration.agents.map((configuration) => ({
+        configuration,
+        agent: publicAgent(configuration, generateOpaqueValue()),
+        credential: generateOpaqueValue(),
+      }));
+      let store: TranscriptStore | undefined;
+      let meshRunRecorded = false;
+
+      try {
+        store = await TranscriptStore.open(validation.repository.rootDirectory);
+        store.createMeshRun({
+          id: meshRunId,
+          repositoryId: validation.repository.id,
+          status: "starting",
+          agents: agentRuntime.map(({ agent }) => agent),
+        });
+        meshRunRecorded = true;
+        await appServer.initialize();
+        for (const runtime of agentRuntime) {
+          const thread = await appServer.startThread({
+            ...runtime.configuration,
+            agentId: runtime.agent.id,
+            agentCredential: runtime.credential,
+            sandbox: sandboxForRole(runtime.configuration.role),
+          });
+          if (!thread.mcpReady) {
+            throw new Error(`MCP connection for Agent ${runtime.agent.name} is not ready.`);
+          }
+          runtime.agent.threadId = thread.threadId;
+        }
+
+        const writer = agentRuntime.find(({ agent }) => agent.role === "writer");
+        if (!writer?.agent.threadId) {
+          throw new Error("Writer thread is not ready.");
+        }
+        writer.agent.status = "working";
+        const adviser = agentRuntime.find(({ agent }) => agent.role === "adviser");
+        if (adviser) {
+          adviser.agent.status = "idle";
+        }
+        const agents = agentRuntime.map(({ agent }) => agent);
+        await appServer.startObjective({
+          threadId: writer.agent.threadId,
+          objective: writer.agent.objective,
+          roster: agents,
+        });
+        store.markRunning(meshRunId, agents);
+        const meshRun = store.inspectMeshRun(meshRunId);
+        if (!meshRun) {
+          throw new Error("Started Mesh Run could not be read from the Transcript.");
+        }
+        active = { id: meshRunId, appServer, store };
+        return { status: "running", meshRun };
+      } catch (cause) {
+        const message =
+          cause instanceof Error ? cause.message : "Unknown startup prerequisite failure.";
+        if (store && meshRunRecorded) {
+          try {
+            store.markFailed(meshRunId, message);
+          } catch {
+            // Preserve the original prerequisite failure when the Transcript is also unhealthy.
+          }
+        }
+        await closeAfterFailedStart(appServer, store);
+        return {
+          status: "failed",
+          meshRunId,
+          error: {
+            code: "startup.prerequisite_failed",
+            message,
+          },
+        };
+      }
+    },
+
+    async stop(request): Promise<StopMeshResult> {
+      if (!active || active.id !== request.meshRunId) {
+        throw new Error(`Mesh Run ${request.meshRunId} is not active.`);
+      }
+      const stopping = active;
+      try {
+        await stopping.appServer.close();
+        stopping.store.markStopped(stopping.id);
+        return { status: "stopped", meshRunId: request.meshRunId };
+      } catch (cause) {
+        const message =
+          cause instanceof Error ? cause.message : "Unknown resource closure failure.";
+        stopping.store.markFailed(stopping.id, message);
+        throw cause;
+      } finally {
+        stopping.store.close();
+        active = undefined;
+      }
+    },
+
+    async inspectMeshRun(request): Promise<MeshRun | undefined> {
+      const repository = await resolveRepositoryIdentity(request.cwd);
+      if (!repository) {
+        return undefined;
+      }
+      const store = await TranscriptStore.open(repository.rootDirectory);
+      try {
+        return store.inspectMeshRun(request.meshRunId);
+      } finally {
+        store.close();
+      }
     },
   };
 }
 
-async function loadMeshConfiguration(
-  cwd: string,
-  configurationPath: string,
-): Promise<ConfigurationValidationResult> {
-  const absolutePath = resolve(cwd, configurationPath);
-  const tracked = Bun.spawn(["git", "ls-files", "--error-unmatch", "--", absolutePath], {
-    cwd,
-    stderr: "pipe",
-    stdout: "pipe",
-  });
-  if ((await tracked.exited) !== 0) {
-    return invalid(
-      "configuration.not_tracked",
-      "Mesh Configuration must be tracked by Git.",
-      absolutePath,
-    );
-  }
+function publicAgent(configuration: AgentConfiguration, id: string): PublicAgent {
+  return {
+    id,
+    name: configuration.name,
+    role: configuration.role,
+    objective: configuration.objective,
+    capabilities: configuration.capabilities,
+    status: "starting",
+  };
+}
 
-  let configuration: unknown;
+function defaultOpaqueValueGenerator(): () => string {
+  let nextIsCredential = false;
+  return () => {
+    nextIsCredential = !nextIsCredential;
+    return nextIsCredential ? randomUUID() : randomBytes(32).toString("base64url");
+  };
+}
+
+async function closeAfterFailedStart(
+  appServer: AppServerAdapter,
+  store: TranscriptStore | undefined,
+): Promise<void> {
   try {
-    configuration = JSON.parse(await readFile(absolutePath, "utf8"));
+    await appServer.close();
   } catch {
-    return invalid(
-      "configuration.file_invalid",
-      "Mesh Configuration must be readable JSON.",
-      absolutePath,
-    );
+    // Startup already failed; cleanup errors must not replace the explicit primary failure.
   }
-  return validateMeshConfiguration(configuration);
-}
-
-async function resolveRepositoryIdentity(cwd: string): Promise<RepositoryIdentity | undefined> {
-  const command = Bun.spawn(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], {
-    cwd,
-    stderr: "pipe",
-    stdout: "pipe",
-  });
-  const [exitCode, stdout] = await Promise.all([
-    command.exited,
-    new Response(command.stdout).text(),
-  ]);
-  if (exitCode !== 0) {
-    return undefined;
+  try {
+    store?.close();
+  } catch {
+    // Startup already failed; cleanup errors must not replace the explicit primary failure.
   }
-
-  const commonDirectory = await realpath(stdout.trim());
-  return {
-    id: createHash("sha256").update(commonDirectory).digest("hex"),
-    commonDirectory,
-  };
-}
-
-type ConfigurationValidationResult =
-  | { ok: true; configuration: MeshConfiguration }
-  | { ok: false; errors: StartupValidationError[] };
-
-function validateMeshConfiguration(configuration: unknown): ConfigurationValidationResult {
-  if (!isRecord(configuration)) {
-    return invalid("configuration.invalid", "Mesh Configuration must be an object.");
-  }
-  if (configuration.version !== 1) {
-    return invalid(
-      "configuration.version_unsupported",
-      "Mesh Configuration version must be 1.",
-      "version",
-    );
-  }
-  if (!Array.isArray(configuration.agents)) {
-    return invalid(
-      "configuration.agents_required",
-      "Mesh Configuration agents must be an array.",
-      "agents",
-    );
-  }
-
-  const errors: StartupValidationError[] = [];
-  if (configuration.agents.length !== 2) {
-    errors.push({
-      code: "configuration.agents.exactly_two",
-      message: "Mesh Configuration must declare exactly two Agents.",
-      path: "agents",
-    });
-  }
-
-  const seenNames = new Set<string>();
-  for (const [index, candidate] of configuration.agents.entries()) {
-    if (
-      !isRecord(candidate) ||
-      typeof candidate.name !== "string" ||
-      candidate.name.trim() === ""
-    ) {
-      continue;
-    }
-    if (seenNames.has(candidate.name)) {
-      errors.push({
-        code: "configuration.agent.name_duplicate",
-        message: `Agent Name "${candidate.name}" must be unique.`,
-        path: `agents[${index}].name`,
-      });
-    }
-    seenNames.add(candidate.name);
-  }
-
-  const writerCount = configuration.agents.filter(
-    (candidate) => isRecord(candidate) && candidate.role === "writer",
-  ).length;
-  const adviserCount = configuration.agents.filter(
-    (candidate) => isRecord(candidate) && candidate.role === "adviser",
-  ).length;
-  if (writerCount !== 1) {
-    errors.push({
-      code: "configuration.writer.exactly_one",
-      message: "Mesh Configuration must declare exactly one Writer.",
-      path: "agents",
-    });
-  }
-  if (adviserCount !== 1) {
-    errors.push({
-      code: "configuration.adviser.exactly_one",
-      message: "Mesh Configuration must declare exactly one Adviser.",
-      path: "agents",
-    });
-  }
-
-  for (const [index, candidate] of configuration.agents.entries()) {
-    validateAgent(candidate, index, errors);
-  }
-
-  if (errors.length > 0) {
-    return { ok: false, errors };
-  }
-  return { ok: true, configuration: configuration as unknown as MeshConfiguration };
-}
-
-function validateAgent(candidate: unknown, index: number, errors: StartupValidationError[]): void {
-  const prefix = `agents[${index}]`;
-  if (!isRecord(candidate)) {
-    errors.push({
-      code: "configuration.agent.invalid",
-      message: "Agent Configuration must be an object.",
-      path: prefix,
-    });
-    return;
-  }
-
-  requireNonEmptyString(candidate.name, `${prefix}.name`, "name", errors);
-  if (candidate.role !== "writer" && candidate.role !== "adviser") {
-    errors.push({
-      code: "configuration.agent.role_invalid",
-      message: "Agent role must be writer or adviser.",
-      path: `${prefix}.role`,
-    });
-  }
-  requireNonEmptyString(candidate.objective, `${prefix}.objective`, "objective", errors);
-
-  if (!isRecord(candidate.model)) {
-    errors.push({
-      code: "configuration.agent.model_required",
-      message: "Agent model options must be an object.",
-      path: `${prefix}.model`,
-    });
-  } else {
-    requireNonEmptyString(candidate.model.name, `${prefix}.model.name`, "model_name", errors);
-    if (
-      candidate.model.reasoningEffort !== undefined &&
-      (typeof candidate.model.reasoningEffort !== "string" ||
-        candidate.model.reasoningEffort.trim() === "")
-    ) {
-      errors.push({
-        code: "configuration.agent.reasoning_effort_invalid",
-        message: "Agent reasoning effort must be a non-empty string when provided.",
-        path: `${prefix}.model.reasoningEffort`,
-      });
-    }
-  }
-
-  requireNonEmptyString(
-    candidate.trustedInstructions,
-    `${prefix}.trustedInstructions`,
-    "instructions",
-    errors,
-  );
-  if (!Array.isArray(candidate.capabilities)) {
-    errors.push({
-      code: "configuration.agent.capabilities_required",
-      message: "Agent Capabilities must be an array.",
-      path: `${prefix}.capabilities`,
-    });
-  } else {
-    if (candidate.capabilities.length === 0) {
-      errors.push({
-        code: "configuration.agent.capability_required",
-        message: "Agent Configuration must declare at least one descriptive Capability.",
-        path: `${prefix}.capabilities`,
-      });
-    }
-    for (const [capabilityIndex, capability] of candidate.capabilities.entries()) {
-      if (typeof capability !== "string" || capability.trim() === "") {
-        errors.push({
-          code: "configuration.agent.capability_invalid",
-          message: "Every Agent Capability must be a non-empty string.",
-          path: `${prefix}.capabilities[${capabilityIndex}]`,
-        });
-      }
-    }
-  }
-}
-
-function requireNonEmptyString(
-  value: unknown,
-  path: string,
-  field: "name" | "objective" | "model_name" | "instructions",
-  errors: StartupValidationError[],
-): void {
-  if (typeof value === "string" && value.trim() !== "") {
-    return;
-  }
-  const messages = {
-    name: "Agent Name must be a non-empty string.",
-    objective: "Agent Objective must be a non-empty string.",
-    model_name: "Agent model name must be a non-empty string.",
-    instructions: "Agent trusted instructions must be a non-empty string.",
-  } as const;
-  errors.push({
-    code: `configuration.agent.${field}_required`,
-    message: messages[field],
-    path,
-  });
-}
-
-function invalid(
-  code: StartupValidationCode,
-  message: string,
-  path?: string,
-): ConfigurationValidationResult {
-  return {
-    ok: false,
-    errors: [{ code, message, ...(path === undefined ? {} : { path }) }],
-  };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

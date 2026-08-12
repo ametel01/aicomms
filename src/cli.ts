@@ -34,7 +34,7 @@ export async function runCli(
   }
 
   const result = await createSupervisor().start({ cwd, configurationPath });
-  if (result.status === "rejected") {
+  if (result.status !== "running") {
     return writeError(io, result);
   }
   io.stdout.write(`${JSON.stringify(result)}\n`);
@@ -47,7 +47,7 @@ function readOption(args: string[], name: string): string | undefined {
   return value?.startsWith("--") === true ? undefined : value;
 }
 
-function writeError(io: CliIo, result: Extract<StartMeshResult, { status: "rejected" }>): number {
+function writeError(io: CliIo, result: Exclude<StartMeshResult, { status: "running" }>): number {
   io.stderr.write(`${JSON.stringify(result)}\n`);
   return 1;
 }

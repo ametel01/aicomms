@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { createSupervisor } from "../src/supervisor.ts";
 import { canonicalGitDirectory, TestRepository, validConfiguration } from "./support/repository.ts";
+import { ScriptedAppServer } from "./support/scripted-app-server.ts";
 
 const testRepository = new TestRepository();
 
@@ -127,25 +129,30 @@ describe("Supervisor.start", () => {
     testRepository.git(repository, "worktree", "add", "--quiet", "-b", "test-worktree", worktree);
     testRepository.track(worktree);
 
-    const supervisor = createSupervisor();
-    const repositoryResult = await supervisor.start({
+    const repositorySupervisor = createSupervisor({ appServer: new ScriptedAppServer() });
+    const repositoryResult = await repositorySupervisor.start({
       cwd: repository,
       configurationPath,
     });
-    const worktreeResult = await supervisor.start({
+    const worktreeSupervisor = createSupervisor({ appServer: new ScriptedAppServer() });
+    const worktreeResult = await worktreeSupervisor.start({
       cwd: worktree,
       configurationPath: `${worktree}/codex-mesh.json`,
     });
 
-    expect(repositoryResult.status).toBe("validated");
-    expect(worktreeResult.status).toBe("validated");
-    if (repositoryResult.status !== "validated" || worktreeResult.status !== "validated") {
-      throw new Error("Expected both start requests to validate.");
+    expect(repositoryResult.status).toBe("running");
+    expect(worktreeResult.status).toBe("running");
+    if (repositoryResult.status !== "running" || worktreeResult.status !== "running") {
+      throw new Error("Expected both Mesh Runs to start.");
     }
-    expect(worktreeResult.repository).toEqual(repositoryResult.repository);
-    expect(repositoryResult.repository.commonDirectory).toBe(
-      await canonicalGitDirectory(repository),
+    expect(worktreeResult.meshRun.repositoryId).toBe(repositoryResult.meshRun.repositoryId);
+    expect(repositoryResult.meshRun.repositoryId).toBe(
+      createHash("sha256")
+        .update(await canonicalGitDirectory(repository))
+        .digest("hex"),
     );
-    expect(repositoryResult.repository.id).toMatch(/^[a-f0-9]{64}$/);
+
+    await repositorySupervisor.stop({ meshRunId: repositoryResult.meshRun.id });
+    await worktreeSupervisor.stop({ meshRunId: worktreeResult.meshRun.id });
   });
 });
