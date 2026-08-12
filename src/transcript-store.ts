@@ -66,8 +66,11 @@ export interface TranscriptEvent {
     | "handling.failed"
     | "conversation.completed"
     | "conversation.failed"
+    | "conversation.expired"
+    | "conversation.limit_reached"
     | "delivery.rejected"
     | "delivery.cancelled"
+    | "delivery.expired"
     | "delivery.ambiguous";
   createdAt: string;
 }
@@ -92,6 +95,20 @@ export interface SupervisorNotice {
   reason: string;
   createdAt: string;
 }
+
+export interface ConversationLimits {
+  agentTriggeredMessages: number;
+  totalMessages: number;
+  elapsedMilliseconds: number;
+}
+
+export type MessageAcceptance =
+  | { accepted: true; newConversation: boolean }
+  | {
+      accepted: false;
+      reason: string;
+      conversationStatus?: ConversationSnapshot["status"];
+    };
 
 interface MeshRunRow {
   id: string;
@@ -225,6 +242,10 @@ export class TranscriptStore {
     ensureColumn(database, "deliveries", "failure_message", "TEXT");
     ensureColumn(database, "handlings", "failure_message", "TEXT");
     ensureMessageColumn(database);
+    database.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS one_reply_per_question
+       ON messages(in_reply_to) WHERE kind = 'reply' AND in_reply_to IS NOT NULL`,
+    );
     return new TranscriptStore(database);
   }
 
@@ -297,18 +318,82 @@ export class TranscriptStore {
       .run(agent.status, agent.id, meshRunId);
   }
 
-  recordNotification(meshRunId: string, message: Message): void {
+  recordAgentMessage(
+    meshRunId: string,
+    message: Message,
+    startsConversation: boolean,
+    limits: ConversationLimits,
+    now: number,
+  ): MessageAcceptance {
+    let result: MessageAcceptance = { accepted: false, reason: "Message acceptance failed." };
     const record = this.database.transaction(() => {
-      this.database
-        .query(
-          `INSERT INTO conversations (id, mesh_run_id, status, created_at)
-           VALUES (?, ?, 'open', ?) ON CONFLICT(id) DO NOTHING`,
-        )
-        .run(message.conversationId, meshRunId, message.createdAt);
+      if (this.messageExists(message.id)) {
+        result = { accepted: false, reason: "Duplicate Message ID was rejected." };
+        return;
+      }
+      const conversation = this.conversationRow(message.conversationId);
+      if (startsConversation) {
+        if (conversation) {
+          result = { accepted: false, reason: "Duplicate Conversation ID was rejected." };
+          return;
+        }
+        this.database
+          .query(
+            `INSERT INTO conversations (id, mesh_run_id, status, created_at)
+             VALUES (?, ?, 'open', ?)`,
+          )
+          .run(message.conversationId, meshRunId, message.createdAt);
+      } else if (!conversation) {
+        result = { accepted: false, reason: "Causal Conversation was not found." };
+        return;
+      } else if (conversation.status !== "open") {
+        result = {
+          accepted: false,
+          reason: `Conversation is already ${conversation.status}.`,
+          conversationStatus: conversation.status,
+        };
+        return;
+      } else if (now - Date.parse(conversation.created_at) >= limits.elapsedMilliseconds) {
+        this.terminateConversation(message.conversationId, "expired");
+        result = {
+          accepted: false,
+          reason: "Conversation deadline has elapsed.",
+          conversationStatus: "expired",
+        };
+        return;
+      }
+      if (this.hasRepeatedMessage(message)) {
+        result = {
+          accepted: false,
+          reason: "Repeated sender-recipient-body Message was rejected.",
+        };
+        return;
+      }
+      const counts = this.messageCounts(message.conversationId);
+      if (counts.agentTriggered >= limits.agentTriggeredMessages) {
+        this.terminateConversation(message.conversationId, "limit_reached");
+        result = {
+          accepted: false,
+          reason: `Conversation Agent-triggering Message limit of ${limits.agentTriggeredMessages} has been reached.`,
+          conversationStatus: "limit_reached",
+        };
+        return;
+      }
+      if (counts.total >= limits.totalMessages) {
+        this.terminateConversation(message.conversationId, "limit_reached");
+        result = {
+          accepted: false,
+          reason: `Conversation total Message limit of ${limits.totalMessages} has been reached.`,
+          conversationStatus: "limit_reached",
+        };
+        return;
+      }
       this.insertMessage(message);
       this.recordEvent(message.conversationId, "message.accepted");
+      result = { accepted: true, newConversation: startsConversation };
     });
     record();
+    return result;
   }
 
   completeQuestionWithReply(
@@ -316,7 +401,10 @@ export class TranscriptStore {
     turnId: string,
     finalOutput: string,
     reply: Message,
-  ): void {
+    limits: ConversationLimits,
+    now: number,
+  ): MessageAcceptance {
+    let result: MessageAcceptance = { accepted: false, reason: "Reply acceptance failed." };
     const complete = this.database.transaction(() => {
       this.database
         .query(
@@ -324,10 +412,52 @@ export class TranscriptStore {
         )
         .run(finalOutput, message.id, turnId);
       this.recordEvent(message.conversationId, "handling.completed");
+      const conversation = this.conversationRow(message.conversationId);
+      if (conversation?.status !== "open") {
+        result = {
+          accepted: false,
+          reason: `Conversation is already ${conversation?.status ?? "unavailable"}.`,
+          ...(conversation ? { conversationStatus: conversation.status } : {}),
+        };
+        return;
+      }
+      if (now - Date.parse(conversation.created_at) >= limits.elapsedMilliseconds) {
+        this.terminateConversation(message.conversationId, "expired");
+        result = {
+          accepted: false,
+          reason: "Conversation deadline elapsed before Reply acceptance.",
+          conversationStatus: "expired",
+        };
+        return;
+      }
+      if (
+        this.messageExists(reply.id) ||
+        this.hasRepeatedMessage(reply) ||
+        this.hasReplyForQuestion(message.id)
+      ) {
+        this.failConversationIfOpen(message.conversationId);
+        result = {
+          accepted: false,
+          reason: "Correlated Reply was rejected as a duplicate.",
+          conversationStatus: "failed",
+        };
+        return;
+      }
+      if (this.messageCounts(message.conversationId).total >= limits.totalMessages) {
+        this.terminateConversation(message.conversationId, "limit_reached");
+        result = {
+          accepted: false,
+          reason: `Conversation total Message limit of ${limits.totalMessages} has been reached.`,
+          conversationStatus: "limit_reached",
+        };
+        return;
+      }
       this.insertMessage(reply);
       this.recordEvent(reply.conversationId, "message.accepted");
+      result = { accepted: true, newConversation: false };
     });
     complete();
+    return result;
   }
 
   failQuestionWithoutReply(message: Message, turnId: string): SupervisorNotice {
@@ -398,6 +528,18 @@ export class TranscriptStore {
     return row?.status === "open";
   }
 
+  expireConversation(conversationId: string, now: number, limits: ConversationLimits): boolean {
+    const conversation = this.conversationRow(conversationId);
+    if (
+      conversation?.status !== "open" ||
+      now - Date.parse(conversation.created_at) < limits.elapsedMilliseconds
+    ) {
+      return false;
+    }
+    this.database.transaction(() => this.terminateConversation(conversationId, "expired"))();
+    return true;
+  }
+
   cancelDelivery(message: Message, failureMessage: string): void {
     const cancel = this.database.transaction(() => {
       const result = this.database
@@ -413,7 +555,7 @@ export class TranscriptStore {
     cancel();
   }
 
-  completeNotificationHandling(message: Message, turnId: string, finalOutput?: string): void {
+  completeHandling(message: Message, turnId: string, finalOutput?: string): void {
     const complete = this.database.transaction(() => {
       this.database
         .query(
@@ -448,10 +590,7 @@ export class TranscriptStore {
         )
         .run(failureMessage, message.id);
       this.recordEvent(message.conversationId, "delivery.ambiguous");
-      this.database
-        .query("UPDATE conversations SET status = 'failed' WHERE id = ?")
-        .run(message.conversationId);
-      this.recordEvent(message.conversationId, "conversation.failed");
+      this.failConversationIfOpen(message.conversationId);
     });
     fail();
   }
@@ -464,10 +603,7 @@ export class TranscriptStore {
         )
         .run(failureMessage, message.id);
       this.recordEvent(message.conversationId, "delivery.rejected");
-      this.database
-        .query("UPDATE conversations SET status = 'failed' WHERE id = ?")
-        .run(message.conversationId);
-      this.recordEvent(message.conversationId, "conversation.failed");
+      this.failConversationIfOpen(message.conversationId);
     });
     reject();
   }
@@ -480,10 +616,7 @@ export class TranscriptStore {
         )
         .run(failureMessage, message.id, turnId);
       this.recordEvent(message.conversationId, "handling.failed");
-      this.database
-        .query("UPDATE conversations SET status = 'failed' WHERE id = ?")
-        .run(message.conversationId);
-      this.recordEvent(message.conversationId, "conversation.failed");
+      this.failConversationIfOpen(message.conversationId);
     });
     fail();
   }
@@ -592,6 +725,97 @@ export class TranscriptStore {
     this.database
       .query("INSERT INTO transcript_events (conversation_id, type, created_at) VALUES (?, ?, ?)")
       .run(conversationId, type, new Date().toISOString());
+  }
+
+  private conversationRow(conversationId: string): {
+    status: ConversationSnapshot["status"];
+    created_at: string;
+  } | null {
+    return this.database
+      .query("SELECT status, created_at FROM conversations WHERE id = ?")
+      .get(conversationId) as {
+      status: ConversationSnapshot["status"];
+      created_at: string;
+    } | null;
+  }
+
+  private messageExists(messageId: string): boolean {
+    return Boolean(this.database.query("SELECT 1 FROM messages WHERE id = ?").get(messageId));
+  }
+
+  private hasRepeatedMessage(message: Message): boolean {
+    return Boolean(
+      this.database
+        .query(
+          `SELECT 1 FROM messages
+           WHERE conversation_id = ? AND sender_agent_id = ? AND recipient_agent_id = ? AND body = ?
+           LIMIT 1`,
+        )
+        .get(message.conversationId, message.senderAgentId, message.recipientAgentId, message.body),
+    );
+  }
+
+  private hasReplyForQuestion(questionId: string): boolean {
+    return Boolean(
+      this.database
+        .query("SELECT 1 FROM messages WHERE kind = 'reply' AND in_reply_to = ? LIMIT 1")
+        .get(questionId),
+    );
+  }
+
+  private messageCounts(conversationId: string): { agentTriggered: number; total: number } {
+    const row = this.database
+      .query(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN kind != 'reply' THEN 1 ELSE 0 END) AS agent_triggered
+         FROM messages WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as { total: number; agent_triggered: number | null };
+    return { total: row.total, agentTriggered: row.agent_triggered ?? 0 };
+  }
+
+  private failConversationIfOpen(conversationId: string): void {
+    const result = this.database
+      .query("UPDATE conversations SET status = 'failed' WHERE id = ? AND status = 'open'")
+      .run(conversationId);
+    if (result.changes === 1) {
+      this.recordEvent(conversationId, "conversation.failed");
+    }
+  }
+
+  private terminateConversation(conversationId: string, status: "expired" | "limit_reached"): void {
+    const result = this.database
+      .query("UPDATE conversations SET status = ? WHERE id = ? AND status = 'open'")
+      .run(status, conversationId);
+    if (result.changes !== 1) {
+      return;
+    }
+    const pending = this.database
+      .query(
+        `SELECT deliveries.message_id
+         FROM deliveries
+         JOIN messages ON messages.id = deliveries.message_id
+         WHERE messages.conversation_id = ? AND deliveries.status IN ('accepted', 'queued')`,
+      )
+      .all(conversationId) as Array<{ message_id: string }>;
+    const deliveryStatus = status === "expired" ? "expired" : "cancelled";
+    const deliveryEvent = status === "expired" ? "delivery.expired" : "delivery.cancelled";
+    for (const { message_id: messageId } of pending) {
+      this.database
+        .query("UPDATE deliveries SET status = ?, failure_message = ? WHERE message_id = ?")
+        .run(
+          deliveryStatus,
+          status === "expired"
+            ? "Conversation deadline elapsed before Delivery."
+            : "Conversation Message limit was reached before Delivery.",
+          messageId,
+        );
+      this.recordEvent(conversationId, deliveryEvent);
+    }
+    this.recordEvent(
+      conversationId,
+      status === "expired" ? "conversation.expired" : "conversation.limit_reached",
+    );
   }
 
   private completeConversationIfReady(conversationId: string): void {

@@ -21,6 +21,7 @@ import {
   validateStartup,
 } from "./startup-validation.ts";
 import {
+  type ConversationLimits,
   type ConversationSnapshot,
   type MeshRun,
   type Message,
@@ -34,6 +35,7 @@ export type {
   AgentLifecycleStatus,
   AgentModelOptions,
   AgentRole,
+  ConversationLimits,
   MeshConfiguration,
   PublicAgent,
   RepositoryIdentity,
@@ -69,6 +71,9 @@ export interface Supervisor {
 export interface SupervisorOptions {
   appServer?: AppServerAdapter;
   generateOpaqueValue?: () => string;
+  now?: () => number;
+  scheduleDeadline?: (callback: () => void, delayMilliseconds: number) => () => void;
+  conversationLimits?: Partial<ConversationLimits>;
 }
 
 interface ActiveMeshRun {
@@ -77,11 +82,33 @@ interface ActiveMeshRun {
   discoveryServer: DiscoveryServer;
   store: TranscriptStore;
   unsubscribeFromThreadStatus: () => void;
+  cancelDeadlines: () => void;
+}
+
+const DEFAULT_CONVERSATION_LIMITS: ConversationLimits = {
+  agentTriggeredMessages: 4,
+  totalMessages: 8,
+  elapsedMilliseconds: 5 * 60 * 1000,
+};
+
+function normalizedConversationLimits(
+  configured: Partial<ConversationLimits> | undefined,
+): ConversationLimits {
+  const limits = { ...DEFAULT_CONVERSATION_LIMITS, ...configured };
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`Conversation limit ${name} must be a positive safe integer.`);
+    }
+  }
+  return limits;
 }
 
 export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
   const appServer = options.appServer ?? unavailableAppServerAdapter();
   const generateOpaqueValue = options.generateOpaqueValue ?? defaultOpaqueValueGenerator();
+  const now = options.now ?? Date.now;
+  const scheduleDeadline = options.scheduleDeadline ?? defaultDeadlineScheduler;
+  const conversationLimits = normalizedConversationLimits(options.conversationLimits);
   let active: ActiveMeshRun | undefined;
 
   return {
@@ -122,6 +149,11 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         noticeQueues: new Map(),
         meshRunId,
         handlingConversations: new Map(),
+        objectiveAgentIds: new Set(),
+        conversationDeadlineCancellations: new Map(),
+        now,
+        scheduleDeadline,
+        limits: conversationLimits,
       };
 
       try {
@@ -145,6 +177,12 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           }
           const transcript = store;
           const validatedInput = validateNotificationInput(input);
+          const inheritedConversation = scheduler.handlingConversations.get(callerAgentId);
+          if (!inheritedConversation && !scheduler.objectiveAgentIds.has(callerAgentId)) {
+            throw new Error(
+              "Only the Writer's initial Objective or an active Message Handling may start peer communication.",
+            );
+          }
           const recipient = agents.find((agent) => agent.id === input.recipientAgentId);
           if (!recipient?.threadId) {
             throw new Error("Recipient Agent is unavailable.");
@@ -153,13 +191,31 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           const message = peerMessage(
             kind,
             generateOpaqueValue(),
-            scheduler.handlingConversations.get(callerAgentId) ?? generateOpaqueValue(),
+            inheritedConversation ?? generateOpaqueValue(),
             callerAgentId,
             validatedInput.recipientAgentId,
             validatedInput.body,
             validatedInput.context,
+            new Date(scheduler.now()).toISOString(),
           );
-          transcript.recordNotification(meshRunId, message);
+          const acceptance = transcript.recordAgentMessage(
+            meshRunId,
+            message,
+            inheritedConversation === undefined,
+            scheduler.limits,
+            scheduler.now(),
+          );
+          if (!acceptance.accepted) {
+            if (acceptance.conversationStatus) {
+              cancelConversationDeadline(scheduler, message.conversationId);
+              purgeTerminalConversationFromScheduler(scheduler, transcript, message.conversationId);
+              scheduleAllDeliveries(scheduler, appServer, transcript);
+            }
+            throw new Error(acceptance.reason);
+          }
+          if (acceptance.newConversation) {
+            scheduleConversationDeadline(scheduler, appServer, transcript, message);
+          }
           enqueueNotification(scheduler, appServer, transcript, meshRunId, recipient, message);
           return message.id;
         };
@@ -181,6 +237,9 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
             return;
           }
           agent.status = lifecycleStatus(status);
+          if (agent.status !== "working") {
+            scheduler.objectiveAgentIds.delete(agent.id);
+          }
           store?.updateAgentStatus(meshRunId, agent);
           if ((agent.status === "idle" || agent.status === "unloaded") && store) {
             scheduleDelivery(scheduler, appServer, store, meshRunId, agent);
@@ -209,6 +268,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         if (adviser) {
           adviser.agent.status = "idle";
         }
+        scheduler.objectiveAgentIds.add(writer.agent.id);
         await appServer.startObjective({
           threadId: writer.agent.threadId,
           objective: writer.agent.objective,
@@ -225,6 +285,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           discoveryServer,
           store,
           unsubscribeFromThreadStatus,
+          cancelDeadlines: () => cancelAllConversationDeadlines(scheduler),
         };
         return { status: "running", meshRun };
       } catch (cause) {
@@ -238,6 +299,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           }
         }
         unsubscribeFromThreadStatus?.();
+        cancelAllConversationDeadlines(scheduler);
         await closeAfterFailedStart(appServer, discoveryServer, store);
         return {
           status: "failed",
@@ -258,6 +320,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
       let closeFailure: unknown;
       try {
         stopping.unsubscribeFromThreadStatus();
+        stopping.cancelDeadlines();
         try {
           await stopping.appServer.close();
         } catch (cause) {
@@ -374,10 +437,87 @@ interface DeliveryScheduler {
   noticeQueues: Map<string, SupervisorNotice[]>;
   meshRunId: string;
   handlingConversations: Map<string, string>;
+  objectiveAgentIds: Set<string>;
+  conversationDeadlineCancellations: Map<string, () => void>;
+  now: () => number;
+  scheduleDeadline: (callback: () => void, delayMilliseconds: number) => () => void;
+  limits: ConversationLimits;
 }
 
 const MAX_QUEUED_MESSAGES_PER_AGENT = 32;
 const MAX_QUEUED_MESSAGES_PER_MESH = 128;
+
+function defaultDeadlineScheduler(callback: () => void, delayMilliseconds: number): () => void {
+  const timeout = setTimeout(callback, delayMilliseconds);
+  timeout.unref?.();
+  return () => clearTimeout(timeout);
+}
+
+function scheduleConversationDeadline(
+  scheduler: DeliveryScheduler,
+  appServer: AppServerAdapter,
+  store: TranscriptStore,
+  rootMessage: Message,
+): void {
+  const cancel = scheduler.scheduleDeadline(() => {
+    scheduler.conversationDeadlineCancellations.delete(rootMessage.conversationId);
+    if (!store.expireConversation(rootMessage.conversationId, scheduler.now(), scheduler.limits)) {
+      return;
+    }
+    queueSupervisorNotice(
+      scheduler,
+      appServer,
+      store,
+      rootMessage,
+      "Conversation deadline elapsed.",
+    );
+    purgeTerminalConversationFromScheduler(scheduler, store, rootMessage.conversationId);
+    scheduleAllDeliveries(scheduler, appServer, store);
+  }, scheduler.limits.elapsedMilliseconds);
+  scheduler.conversationDeadlineCancellations.set(rootMessage.conversationId, cancel);
+}
+
+function cancelConversationDeadline(scheduler: DeliveryScheduler, conversationId: string): void {
+  scheduler.conversationDeadlineCancellations.get(conversationId)?.();
+  scheduler.conversationDeadlineCancellations.delete(conversationId);
+}
+
+function cancelAllConversationDeadlines(scheduler: DeliveryScheduler): void {
+  for (const cancel of scheduler.conversationDeadlineCancellations.values()) {
+    cancel();
+  }
+  scheduler.conversationDeadlineCancellations.clear();
+}
+
+function scheduleAllDeliveries(
+  scheduler: DeliveryScheduler,
+  appServer: AppServerAdapter,
+  store: TranscriptStore,
+): void {
+  for (const agent of scheduler.agents) {
+    if (agent.status === "idle" || agent.status === "unloaded") {
+      scheduleDelivery(scheduler, appServer, store, scheduler.meshRunId, agent);
+    }
+  }
+}
+
+function purgeTerminalConversationFromScheduler(
+  scheduler: DeliveryScheduler,
+  store: TranscriptStore,
+  conversationId: string,
+): void {
+  for (const queue of scheduler.queues.values()) {
+    for (let index = queue.length - 1; index >= 0; index -= 1) {
+      const message = queue[index];
+      if (!message || message.conversationId !== conversationId) {
+        continue;
+      }
+      queue.splice(index, 1);
+      scheduler.queuedMessageIds.delete(message.id);
+      store.cancelDelivery(message, "Delivery cancelled because its Conversation is terminal.");
+    }
+  }
+}
 
 function enforceQueueCapacity(scheduler: DeliveryScheduler, recipient: PublicAgent): void {
   const recipientQueue = scheduler.queues.get(recipient.id) ?? [];
@@ -495,6 +635,10 @@ async function drainRecipientQueue(
         } finally {
           scheduler.handlingConversations.delete(recipient.id);
         }
+        if (!store.isConversationOpen(message.conversationId)) {
+          cancelConversationDeadline(scheduler, message.conversationId);
+          purgeTerminalConversationFromScheduler(scheduler, store, message.conversationId);
+        }
         if (outcome === "ambiguous") {
           return;
         }
@@ -575,6 +719,7 @@ function peerMessage(
   recipientAgentId: string,
   body: string,
   context: NotificationContext | undefined,
+  createdAt: string,
 ): Message {
   return {
     id,
@@ -582,7 +727,7 @@ function peerMessage(
     senderAgentId,
     recipientAgentId,
     conversationId,
-    createdAt: new Date().toISOString(),
+    createdAt,
     body,
     ...context,
   };
@@ -634,7 +779,12 @@ async function deliverMessage(
   store.markHandlingActive(message, handling.turnId);
   try {
     const completion = await handling.completed;
-    if (message.kind === "question") {
+    if (store.expireConversation(message.conversationId, scheduler.now(), scheduler.limits)) {
+      queueSupervisorNotice(scheduler, appServer, store, message, "Conversation deadline elapsed.");
+    }
+    if (!store.isConversationOpen(message.conversationId)) {
+      store.completeHandling(message, handling.turnId, completion.finalOutput);
+    } else if (message.kind === "question") {
       const finalOutput = completion.finalOutput?.trim();
       if (!finalOutput) {
         enqueueSupervisorNotice(
@@ -650,7 +800,7 @@ async function deliverMessage(
           senderAgentId: message.recipientAgentId,
           recipientAgentId: message.senderAgentId,
           conversationId: message.conversationId,
-          createdAt: new Date().toISOString(),
+          createdAt: new Date(scheduler.now()).toISOString(),
           body: finalOutput,
           inReplyTo: message.id,
         };
@@ -667,12 +817,23 @@ async function deliverMessage(
           );
           store.failHandling(message, handling.turnId, "Question asker is unavailable.");
         } else {
-          store.completeQuestionWithReply(message, handling.turnId, finalOutput, reply);
-          enqueueNotification(scheduler, appServer, store, meshRunId, replyRecipient, reply);
+          const acceptance = store.completeQuestionWithReply(
+            message,
+            handling.turnId,
+            finalOutput,
+            reply,
+            scheduler.limits,
+            scheduler.now(),
+          );
+          if (acceptance.accepted) {
+            enqueueNotification(scheduler, appServer, store, meshRunId, replyRecipient, reply);
+          } else {
+            queueSupervisorNotice(scheduler, appServer, store, message, acceptance.reason);
+          }
         }
       }
     } else {
-      store.completeNotificationHandling(message, handling.turnId, completion.finalOutput);
+      store.completeHandling(message, handling.turnId, completion.finalOutput);
     }
   } catch (cause) {
     store.failHandling(message, handling.turnId, failureMessage(cause));

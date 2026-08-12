@@ -8,7 +8,9 @@
 > Notification delivery with durable outcomes. Questions now complete asynchronously through a
 > correlated Reply turn, with deferred failures delivered as Supervisor Notices. Message input,
 > Repository paths, authenticated identity, and fixed role authority are enforced at the Agent
-> boundary. The Operator CLI does not yet connect to a real Codex app-server.
+> boundary. Causal Conversations enforce duplicate, Message-count, and five-minute deadline
+> controls without reopening terminal work. The Operator CLI does not yet connect to a real Codex
+> app-server.
 
 ## Confirmed v0
 
