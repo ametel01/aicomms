@@ -4,7 +4,8 @@
 
 > **Status:** implementation in progress. The Supervisor Interface validates startup and exercises
 > atomic two-Agent lifecycle behavior with a scripted app-server Adapter and durable SQLite state.
-> The Operator CLI does not yet connect to a real Codex app-server or route Messages.
+> Managed threads receive authenticated stdio MCP adapters for public Agent discovery. The Operator
+> CLI does not yet connect to a real Codex app-server or route Messages.
 
 ## Confirmed v0
 

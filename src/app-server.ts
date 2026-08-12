@@ -2,10 +2,18 @@ import type { AgentConfiguration, AgentRole, PublicAgent } from "./startup-valid
 
 export type AgentSandbox = "workspace-write" | "read-only";
 
+export interface McpServerLaunch {
+  transport: "stdio";
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
 export interface StartThreadRequest extends AgentConfiguration {
   agentId: string;
   agentCredential: string;
   sandbox: AgentSandbox;
+  mcpServer: McpServerLaunch;
 }
 
 export interface ThreadHandle {
@@ -23,8 +31,12 @@ export interface AppServerAdapter {
   initialize(): Promise<void>;
   startThread(request: StartThreadRequest): Promise<ThreadHandle>;
   startObjective(request: StartObjectiveRequest): Promise<{ turnId: string }>;
+  onThreadStatusChanged(listener: ThreadStatusListener): () => void;
   close(): Promise<void>;
 }
+
+export type ThreadStatus = "active" | "idle" | "closed" | "system-error";
+export type ThreadStatusListener = (threadId: string, status: ThreadStatus) => void;
 
 export function unavailableAppServerAdapter(): AppServerAdapter {
   return {
@@ -36,6 +48,9 @@ export function unavailableAppServerAdapter(): AppServerAdapter {
     },
     async startObjective(): Promise<{ turnId: string }> {
       throw new Error("The real Codex app-server Adapter is not available yet.");
+    },
+    onThreadStatusChanged(): () => void {
+      return () => {};
     },
     async close(): Promise<void> {},
   };

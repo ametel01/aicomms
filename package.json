@@ -8,7 +8,7 @@
     "codex-meshd": "./src/cli.ts"
   },
   "scripts": {
-    "build": "bun build ./src/cli.ts --outdir ./dist --target bun",
+    "build": "bun build ./src/cli.ts ./src/mcp-adapter.ts --outdir ./dist --target bun",
     "check": "biome check .",
     "check:fix": "biome check --write .",
     "test": "bun test",

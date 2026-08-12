@@ -127,6 +127,12 @@ export class TranscriptStore {
     update();
   }
 
+  updateAgentStatus(meshRunId: string, agent: PublicAgent): void {
+    this.database
+      .query("UPDATE agents SET status = ? WHERE id = ? AND mesh_run_id = ?")
+      .run(agent.status, agent.id, meshRunId);
+  }
+
   inspectMeshRun(meshRunId: string): MeshRun | undefined {
     const run = this.database
       .query("SELECT id, repository_id, status, failure_message FROM mesh_runs WHERE id = ?")

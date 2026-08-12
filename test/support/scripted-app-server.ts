@@ -3,6 +3,8 @@ import type {
   StartObjectiveRequest,
   StartThreadRequest,
   ThreadHandle,
+  ThreadStatus,
+  ThreadStatusListener,
 } from "../../src/app-server.ts";
 
 export type ScriptedFailure =
@@ -20,8 +22,20 @@ export class ScriptedAppServer implements AppServerAdapter {
     | { operation: "start-objective"; request: StartObjectiveRequest }
     | { operation: "close" }
   > = [];
+  statusSubscriptionCount = 0;
+  readonly #statusListeners = new Set<ThreadStatusListener>();
 
   constructor(private readonly failure?: ScriptedFailure) {}
+
+  threadRequests(): StartThreadRequest[] {
+    return this.calls.flatMap((call) => (call.operation === "start-thread" ? [call.request] : []));
+  }
+
+  emitThreadStatus(threadId: string, status: ThreadStatus): void {
+    for (const listener of this.#statusListeners) {
+      listener(threadId, status);
+    }
+  }
 
   async initialize(): Promise<void> {
     this.calls.push({ operation: "initialize" });
@@ -47,6 +61,12 @@ export class ScriptedAppServer implements AppServerAdapter {
       throw new Error("scripted Writer Objective failure");
     }
     return { turnId: "turn-writer-objective" };
+  }
+
+  onThreadStatusChanged(listener: ThreadStatusListener): () => void {
+    this.statusSubscriptionCount += 1;
+    this.#statusListeners.add(listener);
+    return () => this.#statusListeners.delete(listener);
   }
 
   async close(): Promise<void> {

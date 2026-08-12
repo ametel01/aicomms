@@ -4,6 +4,7 @@ import {
   sandboxForRole,
   unavailableAppServerAdapter,
 } from "./app-server.ts";
+import { DiscoveryServer } from "./discovery-server.ts";
 import {
   type AgentConfiguration,
   type AgentLifecycleStatus,
@@ -60,7 +61,9 @@ export interface SupervisorOptions {
 interface ActiveMeshRun {
   id: string;
   appServer: AppServerAdapter;
+  discoveryServer: DiscoveryServer;
   store: TranscriptStore;
+  unsubscribeFromThreadStatus: () => void;
 }
 
 export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
@@ -94,6 +97,8 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         credential: generateOpaqueValue(),
       }));
       let store: TranscriptStore | undefined;
+      let discoveryServer: DiscoveryServer | undefined;
+      let unsubscribeFromThreadStatus: (() => void) | undefined;
       let meshRunRecorded = false;
 
       try {
@@ -105,13 +110,28 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           agents: agentRuntime.map(({ agent }) => agent),
         });
         meshRunRecorded = true;
+        const agents = agentRuntime.map(({ agent }) => agent);
+        discoveryServer = await DiscoveryServer.start(
+          validation.repository.rootDirectory,
+          agentRuntime.map(({ agent, credential }) => ({ agentId: agent.id, credential })),
+          agents,
+        );
         await appServer.initialize();
+        unsubscribeFromThreadStatus = appServer.onThreadStatusChanged((threadId, status) => {
+          const agent = agents.find((candidate) => candidate.threadId === threadId);
+          if (!agent) {
+            return;
+          }
+          agent.status = lifecycleStatus(status);
+          store?.updateAgentStatus(meshRunId, agent);
+        });
         for (const runtime of agentRuntime) {
           const thread = await appServer.startThread({
             ...runtime.configuration,
             agentId: runtime.agent.id,
             agentCredential: runtime.credential,
             sandbox: sandboxForRole(runtime.configuration.role),
+            mcpServer: discoveryServer.launchFor(runtime.agent.id, runtime.credential),
           });
           if (!thread.mcpReady) {
             throw new Error(`MCP connection for Agent ${runtime.agent.name} is not ready.`);
@@ -128,7 +148,6 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         if (adviser) {
           adviser.agent.status = "idle";
         }
-        const agents = agentRuntime.map(({ agent }) => agent);
         await appServer.startObjective({
           threadId: writer.agent.threadId,
           objective: writer.agent.objective,
@@ -139,7 +158,13 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         if (!meshRun) {
           throw new Error("Started Mesh Run could not be read from the Transcript.");
         }
-        active = { id: meshRunId, appServer, store };
+        active = {
+          id: meshRunId,
+          appServer,
+          discoveryServer,
+          store,
+          unsubscribeFromThreadStatus,
+        };
         return { status: "running", meshRun };
       } catch (cause) {
         const message =
@@ -151,7 +176,8 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
             // Preserve the original prerequisite failure when the Transcript is also unhealthy.
           }
         }
-        await closeAfterFailedStart(appServer, store);
+        unsubscribeFromThreadStatus?.();
+        await closeAfterFailedStart(appServer, discoveryServer, store);
         return {
           status: "failed",
           meshRunId,
@@ -168,8 +194,22 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
         throw new Error(`Mesh Run ${request.meshRunId} is not active.`);
       }
       const stopping = active;
+      let closeFailure: unknown;
       try {
-        await stopping.appServer.close();
+        stopping.unsubscribeFromThreadStatus();
+        try {
+          await stopping.appServer.close();
+        } catch (cause) {
+          closeFailure = cause;
+        }
+        try {
+          await stopping.discoveryServer.close();
+        } catch (cause) {
+          closeFailure ??= cause;
+        }
+        if (closeFailure) {
+          throw closeFailure;
+        }
         stopping.store.markStopped(stopping.id);
         return { status: "stopped", meshRunId: request.meshRunId };
       } catch (cause) {
@@ -219,6 +259,7 @@ function defaultOpaqueValueGenerator(): () => string {
 
 async function closeAfterFailedStart(
   appServer: AppServerAdapter,
+  discoveryServer: DiscoveryServer | undefined,
   store: TranscriptStore | undefined,
 ): Promise<void> {
   try {
@@ -227,8 +268,19 @@ async function closeAfterFailedStart(
     // Startup already failed; cleanup errors must not replace the explicit primary failure.
   }
   try {
+    await discoveryServer?.close();
+  } catch {
+    // Startup already failed; cleanup errors must not replace the explicit primary failure.
+  }
+  try {
     store?.close();
   } catch {
     // Startup already failed; cleanup errors must not replace the explicit primary failure.
   }
+}
+
+function lifecycleStatus(
+  status: "active" | "idle" | "closed" | "system-error",
+): AgentLifecycleStatus {
+  return status === "active" ? "working" : status === "idle" ? "idle" : "stopped";
 }
