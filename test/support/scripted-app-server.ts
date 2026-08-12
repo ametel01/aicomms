@@ -125,11 +125,12 @@ export class ScriptedAppServer implements AppServerAdapter {
     return this.calls.flatMap((call) => (call.operation === "start-notice" ? [call.request] : []));
   }
 
-  async initialize(): Promise<void> {
+  async initialize(): Promise<{ codexVersion: string }> {
     this.calls.push({ operation: "initialize" });
     if (this.failure === "initialize") {
       throw new Error("scripted initialize failure");
     }
+    return { codexVersion: "scripted" };
   }
 
   async startThread(request: StartThreadRequest): Promise<ThreadHandle> {

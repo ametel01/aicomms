@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.0",
+    "@openai/codex": "0.147.0",
     "@types/bun": "latest",
     "typescript": "^5.9.0"
   }

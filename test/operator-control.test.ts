@@ -296,6 +296,41 @@ describe("Operator control", () => {
     await harness.close();
   });
 
+  test("correlates an MCP elicitation without a Codex turn ID to the sole active Handling", async () => {
+    let deadlineCancelled = false;
+    const harness = await startHarness({
+      scheduleDeadline: () => () => {
+        deadlineCancelled = true;
+      },
+    });
+    harness.appServer.holdHandlings();
+    await ask(harness.writer, "adviser-id", "Needs MCP input");
+    await waitFor(() => harness.appServer.handlingRequests().length === 1);
+
+    harness.appServer.emitOperatorWait({
+      id: "elicitation-without-turn",
+      type: "input",
+      threadId: "thread-adviser",
+      prompt: "Provide the requested structured input.",
+    });
+
+    const [request] = await harness.supervisor.listOperatorRequests({
+      cwd: harness.cwd,
+      meshRunId: harness.meshRunId,
+    });
+    expect(request).toEqual(
+      expect.objectContaining({
+        id: "elicitation-without-turn",
+        conversationId: "conversation-1",
+        turnId: "turn-handling-1",
+      }),
+    );
+    expect(deadlineCancelled).toBe(true);
+
+    harness.appServer.completeHandling("Handled after MCP elicitation");
+    await harness.close();
+  });
+
   test("interrupts a selected Handling that is cancelled during start acknowledgement", async () => {
     const harness = await startHarness();
     harness.appServer.holdHandlingStarts();

@@ -13,6 +13,7 @@ export interface McpServerLaunch {
 export interface StartThreadRequest extends AgentConfiguration {
   agentId: string;
   agentCredential: string;
+  repositoryRoot: string;
   sandbox: AgentSandbox;
   mcpServer: McpServerLaunch;
 }
@@ -51,7 +52,7 @@ export interface OperatorWaitRequest {
   id: string;
   type: "approval" | "input";
   threadId: string;
-  turnId: string;
+  turnId?: string;
   prompt: string;
 }
 
@@ -73,7 +74,7 @@ export class HandlingStartError extends Error {
 }
 
 export interface AppServerAdapter {
-  initialize(): Promise<void>;
+  initialize(): Promise<{ codexVersion: string }>;
   startThread(request: StartThreadRequest): Promise<ThreadHandle>;
   startObjective(request: StartObjectiveRequest): Promise<{ turnId: string }>;
   startHandling(request: StartHandlingRequest): Promise<HandlingHandle>;
@@ -92,7 +93,7 @@ export type ThreadStatusListener = (threadId: string, status: ThreadStatus) => v
 
 export function unavailableAppServerAdapter(): AppServerAdapter {
   return {
-    async initialize(): Promise<void> {
+    async initialize(): Promise<{ codexVersion: string }> {
       throw new Error("The real Codex app-server Adapter is not available yet.");
     },
     async startThread(): Promise<ThreadHandle> {

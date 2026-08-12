@@ -13,7 +13,7 @@
 > explicit response, and selected Conversations can be cancelled without stopping unrelated work.
 > Unexpected app-server loss fails open work without replay, while the next startup terminalizes
 > stale Mesh evidence as `supervisor_lost` before creating fresh Agent and thread identities.
-> The Operator CLI does not yet connect to a real Codex app-server.
+> Startup validates and reports Codex CLI 0.147.0 before connecting to the real stdio app-server.
 
 ## Confirmed v0
 
@@ -46,6 +46,22 @@ adapters receive distinct credentials and cannot use Operator operations.
 
 The ignored `.codex-meshd/` state directory and its database and private socket are owner-only.
 Normal shutdown retains the Transcript; only the explicit confirmed purge removes it.
+
+## Codex protocol baseline
+
+The real Adapter requires Codex CLI `0.147.0` and fails startup before either Agent works when the
+installed version, initialization response, required methods, or required fields do not match.
+The generated experimental JSON Schema bundle is checked in at `protocol/codex-0.147.0/`.
+
+Regenerate that bundle only with the pinned CLI:
+
+```sh
+codex app-server generate-json-schema --experimental --out protocol/codex-0.147.0
+```
+
+`bun test test/codex-compatibility.test.ts` runs the narrow real smoke test: initialization plus two
+ephemeral managed threads with distinct per-thread MCP identities. The deterministic behavioral
+suite continues to use the scripted Adapter and does not invoke a model.
 
 ## Documentation
 

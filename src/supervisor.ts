@@ -8,8 +8,8 @@ import {
   type OperatorWaitRequest,
   type OperatorWaitResponse,
   sandboxForRole,
-  unavailableAppServerAdapter,
 } from "./app-server.ts";
+import { createCodexAppServerAdapter } from "./codex-app-server.ts";
 import { DiscoveryServer, type SendNotificationInput } from "./discovery-server.ts";
 import {
   type AgentConfiguration,
@@ -59,7 +59,12 @@ export interface StartMeshRequest {
 export type StartMeshResult =
   | { status: "rejected"; errors: SupervisorError[] }
   | { status: "failed"; meshRunId: string; error: SupervisorError }
-  | { status: "running"; meshRun: MeshRun; operatorCredential: string };
+  | {
+      status: "running";
+      meshRun: MeshRun;
+      operatorCredential: string;
+      codexVersion: string;
+    };
 
 export interface StopMeshResult {
   status: "stopped";
@@ -140,7 +145,7 @@ function normalizedConversationLimits(
 }
 
 export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
-  const appServer = options.appServer ?? unavailableAppServerAdapter();
+  const appServer = options.appServer ?? createCodexAppServerAdapter();
   const generateOpaqueValue = options.generateOpaqueValue ?? defaultOpaqueValueGenerator();
   const now = options.now ?? Date.now;
   const scheduleDeadline = options.scheduleDeadline ?? defaultDeadlineScheduler;
@@ -316,7 +321,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
             },
           },
         );
-        await appServer.initialize();
+        const initialization = await appServer.initialize();
         unsubscribeFromThreadStatus = appServer.onThreadStatusChanged((threadId, status) => {
           const agent = agents.find((candidate) => candidate.threadId === threadId);
           if (!agent) {
@@ -369,6 +374,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
             ...runtime.configuration,
             agentId: runtime.agent.id,
             agentCredential: runtime.credential,
+            repositoryRoot: validation.repository.rootDirectory,
             sandbox: sandboxForRole(runtime.configuration.role),
             mcpServer: discoveryServer.launchFor(runtime.agent.id, runtime.credential),
           });
@@ -415,7 +421,12 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
           cancelDeadlines: () => cancelAllConversationDeadlines(scheduler),
           scheduler,
         };
-        return { status: "running", meshRun, operatorCredential };
+        return {
+          status: "running",
+          meshRun,
+          operatorCredential,
+          codexVersion: initialization.codexVersion,
+        };
       } catch (cause) {
         const message =
           cause instanceof Error ? cause.message : "Unknown startup prerequisite failure.";
@@ -855,9 +866,14 @@ function recordOperatorWait(
   if (store.listOperatorRequests(meshRunId).some((request) => request.id === wait.id)) {
     return;
   }
-  const handling = [...scheduler.activeHandlings.values()].find(
-    (candidate) => candidate.threadId === wait.threadId && candidate.turnId === wait.turnId,
+  const threadHandlings = [...scheduler.activeHandlings.values()].filter(
+    (candidate) => candidate.threadId === wait.threadId,
   );
+  const handling = wait.turnId
+    ? threadHandlings.find((candidate) => candidate.turnId === wait.turnId)
+    : threadHandlings.length === 1
+      ? threadHandlings[0]
+      : undefined;
   const startingMessage = scheduler.startingHandlings.get(wait.threadId);
   const conversationId = handling?.message.conversationId ?? startingMessage?.conversationId;
   const request: OperatorRequest = {
@@ -865,7 +881,7 @@ function recordOperatorWait(
     meshRunId,
     type: wait.type,
     threadId: wait.threadId,
-    turnId: wait.turnId,
+    turnId: wait.turnId ?? handling?.turnId ?? "unattributed",
     prompt: wait.prompt,
     status: "pending",
     createdAt: new Date(scheduler.now()).toISOString(),

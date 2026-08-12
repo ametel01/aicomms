@@ -81,6 +81,7 @@ describe("Mesh Run lifecycle", () => {
         ],
       },
       operatorCredential: expect.any(String),
+      codexVersion: "scripted",
     });
     expect(appServer.calls).toEqual([
       { operation: "initialize" },
