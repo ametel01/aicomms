@@ -9,6 +9,7 @@ import type {
   ThreadStatus,
   ThreadStatusListener,
 } from "../../src/app-server.ts";
+import { HandlingStartError } from "../../src/app-server.ts";
 
 export type ScriptedFailure =
   | "initialize"
@@ -17,6 +18,9 @@ export type ScriptedFailure =
   | "mcp"
   | "writer-objective"
   | "handling-start"
+  | "handling-rejected"
+  | "handling-disconnect"
+  | "handling-timeout"
   | "handling-completion"
   | "resume-thread"
   | "close";
@@ -89,7 +93,16 @@ export class ScriptedAppServer implements AppServerAdapter {
   async startHandling(request: StartHandlingRequest): Promise<HandlingHandle> {
     this.calls.push({ operation: "start-handling", request });
     if (this.failure === "handling-start") {
-      throw new Error("scripted Handling acceptance failure");
+      throw new HandlingStartError("scripted ambiguous acceptance", "uncertain");
+    }
+    if (this.failure === "handling-rejected") {
+      throw new HandlingStartError("scripted definite rejection", "rejected");
+    }
+    if (this.failure === "handling-disconnect") {
+      throw new HandlingStartError("scripted disconnect", "uncertain");
+    }
+    if (this.failure === "handling-timeout") {
+      throw new HandlingStartError("scripted timeout", "uncertain");
     }
     return {
       turnId: "turn-handling-1",

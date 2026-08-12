@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { isAbsolute, normalize } from "node:path";
 import {
   type AppServerAdapter,
+  HandlingStartError,
   sandboxForRole,
   unavailableAppServerAdapter,
 } from "./app-server.ts";
@@ -114,6 +115,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
       const scheduler: DeliveryScheduler = {
         queues: new Map(),
         delivering: new Set(),
+        queuedMessageIds: new Set(),
       };
 
       try {
@@ -141,6 +143,7 @@ export function createSupervisor(options: SupervisorOptions = {}): Supervisor {
               if (!recipient?.threadId) {
                 throw new Error("Recipient Agent is unavailable.");
               }
+              enforceQueueCapacity(scheduler, recipient);
               const message = notification(
                 generateOpaqueValue(),
                 generateOpaqueValue(),
@@ -349,6 +352,30 @@ function lifecycleStatus(
 interface DeliveryScheduler {
   queues: Map<string, Message[]>;
   delivering: Set<string>;
+  queuedMessageIds: Set<string>;
+}
+
+const MAX_QUEUED_MESSAGES_PER_AGENT = 32;
+const MAX_QUEUED_MESSAGES_PER_MESH = 128;
+
+function enforceQueueCapacity(scheduler: DeliveryScheduler, recipient: PublicAgent): void {
+  const recipientQueue = scheduler.queues.get(recipient.id) ?? [];
+  const willQueue =
+    recipientQueue.length > 0 ||
+    scheduler.delivering.has(recipient.id) ||
+    recipient.status !== "idle";
+  if (!willQueue) {
+    return;
+  }
+  const recipientQueued = recipientQueue.filter((message) =>
+    scheduler.queuedMessageIds.has(message.id),
+  ).length;
+  if (recipientQueued >= MAX_QUEUED_MESSAGES_PER_AGENT) {
+    throw new Error("Recipient Agent queue limit of 32 Messages has been reached.");
+  }
+  if (scheduler.queuedMessageIds.size >= MAX_QUEUED_MESSAGES_PER_MESH) {
+    throw new Error("Mesh queue limit of 128 Messages has been reached.");
+  }
 }
 
 function enqueueNotification(
@@ -364,6 +391,7 @@ function enqueueNotification(
   queue.push(message);
   if (queue.length > 1 || scheduler.delivering.has(recipient.id) || recipient.status !== "idle") {
     store.markDeliveryQueued(message);
+    scheduler.queuedMessageIds.add(message.id);
   }
   if (recipient.status === "idle" || recipient.status === "unloaded") {
     scheduleDelivery(scheduler, appServer, store, meshRunId, recipient);
@@ -405,6 +433,7 @@ async function drainRecipientQueue(
         } catch (cause) {
           const message = failureMessage(cause);
           for (const failedMessage of queue.splice(0)) {
+            scheduler.queuedMessageIds.delete(failedMessage.id);
             store.failDelivery(failedMessage, message);
           }
           return;
@@ -417,6 +446,7 @@ async function drainRecipientQueue(
       }
       const message = queue.shift();
       if (message) {
+        scheduler.queuedMessageIds.delete(message.id);
         const outcome = await deliverNotification(appServer, store, meshRunId, recipient, message);
         if (outcome === "ambiguous") {
           return;
@@ -468,7 +498,14 @@ async function deliverNotification(
       message,
     });
   } catch (cause) {
-    store.failDelivery(message, failureMessage(cause));
+    const messageText = failureMessage(cause);
+    if (cause instanceof HandlingStartError && cause.acceptance === "rejected") {
+      store.rejectDelivery(message, messageText);
+      recipient.status = "idle";
+      store.updateAgentStatus(meshRunId, recipient);
+      return "idle";
+    }
+    store.failDelivery(message, messageText);
     return "ambiguous";
   }
   store.markHandlingActive(message, handling.turnId);

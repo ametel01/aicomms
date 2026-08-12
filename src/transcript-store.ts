@@ -65,6 +65,7 @@ export interface TranscriptEvent {
     | "handling.failed"
     | "conversation.completed"
     | "conversation.failed"
+    | "delivery.rejected"
     | "delivery.ambiguous";
   createdAt: string;
 }
@@ -356,6 +357,22 @@ export class TranscriptStore {
       this.recordEvent(message.conversationId, "conversation.failed");
     });
     fail();
+  }
+
+  rejectDelivery(message: Message, failureMessage: string): void {
+    const reject = this.database.transaction(() => {
+      this.database
+        .query(
+          "UPDATE deliveries SET status = 'rejected', failure_message = ? WHERE message_id = ?",
+        )
+        .run(failureMessage, message.id);
+      this.recordEvent(message.conversationId, "delivery.rejected");
+      this.database
+        .query("UPDATE conversations SET status = 'failed' WHERE id = ?")
+        .run(message.conversationId);
+      this.recordEvent(message.conversationId, "conversation.failed");
+    });
+    reject();
   }
 
   failHandling(message: Message, turnId: string, failureMessage: string): void {

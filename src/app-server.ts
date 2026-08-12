@@ -42,6 +42,16 @@ export interface HandlingHandle {
   completed: Promise<HandlingCompletion>;
 }
 
+export class HandlingStartError extends Error {
+  constructor(
+    message: string,
+    readonly acceptance: "rejected" | "uncertain",
+  ) {
+    super(message);
+    this.name = "HandlingStartError";
+  }
+}
+
 export interface AppServerAdapter {
   initialize(): Promise<void>;
   startThread(request: StartThreadRequest): Promise<ThreadHandle>;
